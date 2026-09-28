@@ -41,7 +41,7 @@ class ProjectMonitor(FileSystemEventHandler):
         )
 
         event_data: dict[str, str] = {
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
             "type": event.event_type.upper(),
             "path": src_path,
         }
