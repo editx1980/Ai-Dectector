@@ -10,6 +10,7 @@ LOG_FOLDER = PROJECT_FOLDER / "logs"
 SESSIONS_FILE = LOG_FOLDER / "sessions.jsonl"
 TEST_RESULTS_FILE = LOG_FOLDER / "test_results.jsonl"
 ERRORS_FILE = LOG_FOLDER / "errors.jsonl"
+STATIC_ANALYSIS_FILE = LOG_FOLDER / "static_analysis.jsonl"
 EVIDENCE_FILE = LOG_FOLDER / "evidence.jsonl"
 
 CORRELATION_WINDOW_SECONDS = 300
@@ -59,6 +60,33 @@ def load_jsonl(path: Path) -> list[JsonObject]:
         return []
 
     return records
+
+
+def get_static_findings(
+    results: list[JsonObject],
+) -> list[JsonObject]:
+    findings: list[JsonObject] = []
+
+    for result in results:
+        findings_value = result.get("findings")
+
+        if not isinstance(findings_value, list):
+            continue
+
+        findings_list = cast(
+            list[object],
+            findings_value,
+        )
+
+        for finding_value in findings_list:
+            finding = to_json_object(
+                finding_value
+            )
+
+            if finding is not None:
+                findings.append(finding)
+
+    return findings
 
 
 def parse_timestamp(
@@ -145,6 +173,17 @@ def find_related_errors(
     test: JsonObject,
     errors: list[JsonObject],
 ) -> list[JsonObject]:
+    test_run_id = test.get("run_id")
+
+    if isinstance(test_run_id, str):
+        related_errors: list[JsonObject] = []
+
+        for error in errors:
+            if error.get("run_id") == test_run_id:
+                related_errors.append(error)
+
+        return related_errors
+
     test_time = get_timestamp(test)
 
     if test_time is None:
@@ -153,7 +192,7 @@ def find_related_errors(
     test_command = test.get("command")
     test_exit_code = test.get("exit_code")
 
-    related_errors: list[JsonObject] = []
+    related_errors = []
 
     for error in errors:
         error_time = get_timestamp(error)
@@ -179,6 +218,7 @@ def build_evidence(
     sessions: list[JsonObject],
     tests: list[JsonObject],
     errors: list[JsonObject],
+    static_findings: list[JsonObject],
 ) -> list[JsonObject]:
     evidence_records: list[JsonObject] = []
 
@@ -186,6 +226,9 @@ def build_evidence(
         test_time = get_timestamp(test)
 
         if test_time is None:
+            continue
+
+        if not isinstance(test.get("status"), str):
             continue
 
         related_session = find_related_session(
@@ -208,10 +251,12 @@ def build_evidence(
             )
 
         evidence: JsonObject = {
+            "run_id": test.get("run_id"),
             "timestamp": test_time.isoformat(),
             "test": test,
             "change_session": related_session,
             "errors": related_errors,
+            "static_analysis": static_findings,
             "relationship": relationship,
         }
 
@@ -268,6 +313,7 @@ def print_test_info(
     test: JsonObject,
 ) -> None:
     print(f"  Test: {test.get('command')}")
+    print(f"  Run ID: {test.get('run_id')}")
     print(f"  Status: {test.get('status')}")
 
     test_time = get_timestamp(test)
@@ -344,6 +390,16 @@ def print_evidence(
             f"  Related errors: {error_count}"
         )
 
+        static_analysis_count = get_list_length(
+            record,
+            "static_analysis",
+        )
+
+        print(
+            "  Static analysis findings: "
+            f"{static_analysis_count}"
+        )
+
         relationship = get_string(
             record,
             "relationship",
@@ -363,14 +419,25 @@ def main() -> None:
         TEST_RESULTS_FILE
     )
 
+    tests = tests[-1:]
+
     errors = load_jsonl(
         ERRORS_FILE
+    )
+
+    static_analysis = load_jsonl(
+        STATIC_ANALYSIS_FILE
+    )
+
+    static_findings = get_static_findings(
+        static_analysis
     )
 
     evidence = build_evidence(
         sessions=sessions,
         tests=tests,
         errors=errors,
+        static_findings=static_findings,
     )
 
     write_evidence(evidence)

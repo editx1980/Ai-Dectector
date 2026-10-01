@@ -1,282 +1,622 @@
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 import json
-from typing import Any
 
 
 PROJECT_FOLDER = Path(__file__).resolve().parent
 LOG_FOLDER = PROJECT_FOLDER / "logs"
-LOG_FILE = LOG_FOLDER / "events.jsonl"
-SESSION_LOG_FILE = LOG_FOLDER / "sessions.jsonl"
 
-SESSION_TIMEOUT = 60
-DEDUPLICATION_WINDOW = 1
+SESSIONS_FILE = LOG_FOLDER / "sessions.jsonl"
+TEST_RESULTS_FILE = LOG_FOLDER / "test_results.jsonl"
+ERRORS_FILE = LOG_FOLDER / "errors.jsonl"
+STATIC_ANALYSIS_FILE = LOG_FOLDER / "static_analysis.jsonl"
+EVIDENCE_FILE = LOG_FOLDER / "evidence.jsonl"
 
-
-@dataclass
-class Event:
-    timestamp: datetime
-    event_type: str
-    path: Path
-    destination: Path | None = None
+CORRELATION_WINDOW_SECONDS = 300
 
 
-@dataclass
-class ChangeSession:
-    session_number: int
-    started_at: datetime
-    ended_at: datetime
-    duration_seconds: float
-    files: list[str]
-    event_types: list[str]
-    event_count: int
+JsonObject = dict[str, object]
 
 
-def load_events() -> list[Event]:
-    if not LOG_FILE.exists():
+def to_json_object(value: object) -> JsonObject | None:
+    if not isinstance(value, dict):
+        return None
+
+    object_value = cast(dict[object, object], value)
+
+    for key in object_value:
+        if not isinstance(key, str):
+            return None
+
+    return cast(JsonObject, value)
+
+
+def load_jsonl(path: Path) -> list[JsonObject]:
+    if not path.exists():
         return []
 
-    events: list[Event] = []
+    records: list[JsonObject] = []
 
-    with LOG_FILE.open("r", encoding="utf-8") as file:
-        for line in file:
-            line = line.strip()
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            for line in file:
+                stripped_line = line.strip()
 
-            if not line:
-                continue
+                if not stripped_line:
+                    continue
 
-            raw_event: Any = json.loads(line)
+                try:
+                    data: object = json.loads(stripped_line)
+                except json.JSONDecodeError:
+                    continue
 
-            event = Event(
-                timestamp=datetime.fromisoformat(
-                    str(raw_event["timestamp"])
-                ),
-                event_type=str(raw_event["type"]),
-                path=Path(str(raw_event["path"])),
-                destination=(
-                    Path(str(raw_event["destination"]))
-                    if "destination" in raw_event
-                    else None
-                ),
+                record = to_json_object(data)
+
+                if record is not None:
+                    records.append(record)
+
+    except OSError:
+        return []
+
+    return records
+
+
+def get_static_findings(
+    results: list[JsonObject],
+) -> list[JsonObject]:
+    findings: list[JsonObject] = []
+
+    for result in results:
+        findings_value = result.get("findings")
+
+        if not isinstance(findings_value, list):
+            continue
+
+        findings_list = cast(
+            list[object],
+            findings_value,
+        )
+
+        for finding_value in findings_list:
+            finding = to_json_object(
+                finding_value
             )
 
-            events.append(event)
+            if finding is not None:
+                findings.append(finding)
 
-    return events
+    return findings
 
 
-def deduplicate_events(events: list[Event]) -> list[Event]:
-    if not events:
+def normalize_file_path(
+    value: object,
+) -> str | None:
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.replace("\\", "/").strip()
+
+    if not normalized:
+        return None
+
+    return normalized
+
+
+def get_session_files(
+    session: JsonObject | None,
+) -> set[str]:
+    if session is None:
+        return set()
+
+    files_value = session.get("files")
+
+    if not isinstance(files_value, list):
+        return set()
+
+    files = cast(
+        list[object],
+        files_value,
+    )
+
+    normalized_files: set[str] = set()
+
+    for file_value in files:
+        file_path = normalize_file_path(
+            file_value
+        )
+
+        if file_path is not None:
+            normalized_files.add(file_path)
+
+    return normalized_files
+
+
+def find_related_static_findings(
+    session: JsonObject | None,
+    static_findings: list[JsonObject],
+) -> list[JsonObject]:
+    session_files = get_session_files(session)
+
+    if not session_files:
         return []
 
-    deduplicated: list[Event] = [events[0]]
+    related_findings: list[JsonObject] = []
 
-    for event in events[1:]:
-        previous_event = deduplicated[-1]
+    for finding in static_findings:
+        finding_file = normalize_file_path(
+            finding.get("file")
+        )
 
-        same_type = event.event_type == previous_event.event_type
-        same_path = event.path == previous_event.path
+        if finding_file is None:
+            continue
 
-        time_difference = (
-            event.timestamp - previous_event.timestamp
+        if finding_file in session_files:
+            related_findings.append(finding)
+
+    return related_findings
+
+
+def parse_timestamp(
+    value: object,
+) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def get_timestamp(
+    record: JsonObject,
+) -> datetime | None:
+    timestamp = parse_timestamp(
+        record.get("timestamp")
+    )
+
+    if timestamp is not None:
+        return timestamp
+
+    return parse_timestamp(
+        record.get("started_at")
+    )
+
+
+def get_session_start(
+    session: JsonObject,
+) -> datetime | None:
+    return parse_timestamp(
+        session.get("started_at")
+    )
+
+
+def get_session_end(
+    session: JsonObject,
+) -> datetime | None:
+    return parse_timestamp(
+        session.get("ended_at")
+    )
+
+
+def find_related_session(
+    test_time: datetime,
+    sessions: list[JsonObject],
+) -> JsonObject | None:
+    best_session: JsonObject | None = None
+    best_difference: float | None = None
+
+    for session in sessions:
+        session_start = get_session_start(session)
+        session_end = get_session_end(session)
+
+        if session_start is None or session_end is None:
+            continue
+
+        if session_start > test_time:
+            continue
+
+        if session_end > test_time:
+            continue
+
+        difference = (
+            test_time - session_end
         ).total_seconds()
 
+        if difference > CORRELATION_WINDOW_SECONDS:
+            continue
+
         if (
-            same_type
-            and same_path
-            and time_difference <= DEDUPLICATION_WINDOW
+            best_difference is None
+            or difference < best_difference
+        ):
+            best_difference = difference
+            best_session = session
+
+    return best_session
+
+
+def find_related_errors(
+    test: JsonObject,
+    errors: list[JsonObject],
+) -> list[JsonObject]:
+    test_time = get_timestamp(test)
+
+    if test_time is None:
+        return []
+
+    test_command = test.get("command")
+    test_exit_code = test.get("exit_code")
+
+    related_errors: list[JsonObject] = []
+
+    for error in errors:
+        error_time = get_timestamp(error)
+
+        if error_time is None:
+            continue
+
+        if error_time != test_time:
+            continue
+
+        if error.get("command") != test_command:
+            continue
+
+        if error.get("exit_code") != test_exit_code:
+            continue
+
+        related_errors.append(error)
+
+    return related_errors
+
+
+def build_evidence(
+    sessions: list[JsonObject],
+    tests: list[JsonObject],
+    errors: list[JsonObject],
+    static_findings: list[JsonObject],
+) -> list[JsonObject]:
+    evidence_records: list[JsonObject] = []
+
+    for test in tests:
+        test_time = get_timestamp(test)
+
+        if test_time is None:
+            continue
+
+        if not isinstance(
+            test.get("status"),
+            str,
         ):
             continue
 
-        deduplicated.append(event)
+        related_session = find_related_session(
+            test_time,
+            sessions,
+        )
 
-    return deduplicated
+        related_errors = find_related_errors(
+            test,
+            errors,
+        )
 
-
-def create_sessions(
-    events: list[Event],
-) -> list[list[Event]]:
-    if not events:
-        return []
-
-    sessions: list[list[Event]] = []
-    current_session: list[Event] = [events[0]]
-
-    for event in events[1:]:
-        previous_event = current_session[-1]
-
-        time_difference = (
-            event.timestamp - previous_event.timestamp
-        ).total_seconds()
-
-        if time_difference <= SESSION_TIMEOUT:
-            current_session.append(event)
-        else:
-            sessions.append(current_session)
-            current_session = [event]
-
-    sessions.append(current_session)
-
-    return sessions
-
-
-def get_relative_path(path: Path) -> str:
-    try:
-        return str(path.relative_to(PROJECT_FOLDER))
-    except ValueError:
-        return str(path)
-
-
-def build_change_session(
-    session_number: int,
-    session: list[Event],
-) -> ChangeSession:
-    start_time = session[0].timestamp
-    end_time = session[-1].timestamp
-
-    duration = (
-        end_time - start_time
-    ).total_seconds()
-
-    files: list[str] = []
-    event_types: list[str] = []
-
-    for event in session:
-        display_path = get_relative_path(event.path)
-
-        if display_path not in files:
-            files.append(display_path)
-
-        if event.event_type not in event_types:
-            event_types.append(event.event_type)
-
-        if event.destination is not None:
-            display_destination = get_relative_path(
-                event.destination
-            )
-
-            if display_destination not in files:
-                files.append(display_destination)
-
-    return ChangeSession(
-        session_number=session_number,
-        started_at=start_time,
-        ended_at=end_time,
-        duration_seconds=duration,
-        files=files,
-        event_types=event_types,
-        event_count=len(session),
-    )
-
-
-def save_sessions(sessions: list[ChangeSession]) -> None:
-    LOG_FOLDER.mkdir(parents=True, exist_ok=True)
-
-    with SESSION_LOG_FILE.open("w", encoding="utf-8") as file:
-        for session in sessions:
-            session_data: dict[str, object] = {
-                "session_number": session.session_number,
-                "started_at": session.started_at.isoformat(
-                    timespec="milliseconds"
-                ),
-                "ended_at": session.ended_at.isoformat(
-                    timespec="milliseconds"
-                ),
-                "duration_seconds": session.duration_seconds,
-                "files": session.files,
-                "event_types": session.event_types,
-                "event_count": session.event_count,
-            }
-
-            file.write(
-                json.dumps(session_data)
-                + "\n"
-            )
-
-
-def print_session(
-    session: ChangeSession,
-) -> None:
-    print(
-        f"CHANGE SESSION #{session.session_number}"
-    )
-    print(
-        f"Started: "
-        f"{session.started_at.strftime('%H:%M:%S')}"
-    )
-    print(
-        f"Ended:   "
-        f"{session.ended_at.strftime('%H:%M:%S')}"
-    )
-    print(
-        f"Duration: "
-        f"{session.duration_seconds:.0f} seconds"
-    )
-    print()
-    print("Files:")
-
-    for file_path in session.files:
-        print(f"  {file_path}")
-
-    print()
-    print("Event types:")
-
-    for event_type in session.event_types:
-        print(f"  {event_type}")
-
-    print()
-    print(
-        f"Events: {session.event_count}"
-    )
-    print()
-    print("-" * 50)
-    print()
-
-
-def main() -> None:
-    print("=" * 50)
-    print("AI DEVELOPER OVERSEER - v0.3")
-    print("=" * 50)
-    print()
-    print(f"Analyzing: {LOG_FILE}")
-    print(f"Session log: {SESSION_LOG_FILE}")
-    print()
-
-    events = load_events()
-
-    if not events:
-        print("No events found.")
-        return
-
-    deduplicated_events = deduplicate_events(events)
-    raw_sessions = create_sessions(deduplicated_events)
-
-    sessions: list[ChangeSession] = []
-
-    for session_number, raw_session in enumerate(
-        raw_sessions,
-        start=1,
-    ):
-        sessions.append(
-            build_change_session(
-                session_number,
-                raw_session,
+        related_static_findings = (
+            find_related_static_findings(
+                related_session,
+                static_findings,
             )
         )
 
-    save_sessions(sessions)
+        if related_session is not None:
+            relationship = (
+                "Test occurred after a related change session."
+            )
+        else:
+            relationship = (
+                "No related change session was found."
+            )
 
-    print(f"Events found: {len(events)}")
-    print(
-        f"Events after deduplication: "
-        f"{len(deduplicated_events)}"
+        evidence: JsonObject = {
+            "timestamp": test_time.isoformat(),
+            "test": test,
+            "change_session": related_session,
+            "errors": related_errors,
+            "static_analysis": related_static_findings,
+            "relationship": relationship,
+        }
+
+        evidence_records.append(evidence)
+
+    return evidence_records
+
+
+def write_evidence(
+    records: list[JsonObject],
+) -> None:
+    LOG_FOLDER.mkdir(
+        parents=True,
+        exist_ok=True,
     )
-    print(f"Sessions found: {len(sessions)}")
-    print()
 
-    for session in sessions:
-        print_session(session)
+    with EVIDENCE_FILE.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        for record in records:
+            file.write(
+                json.dumps(record) + "\n"
+            )
+
+
+def get_string(
+    record: JsonObject,
+    key: str,
+) -> str:
+    value = record.get(key)
+
+    if isinstance(value, str):
+        return value
+
+    return str(value)
+
+
+def get_list_length(
+    record: JsonObject,
+    key: str,
+) -> int:
+    value = record.get(key)
+
+    if not isinstance(value, list):
+        return 0
+
+    list_value = cast(
+        list[object],
+        value,
+    )
+
+    return len(list_value)
+
+
+def print_test_info(
+    test: JsonObject,
+) -> None:
+    print(
+        f"  Test: {test.get('command')}"
+    )
+    print(
+        f"  Status: {test.get('status')}"
+    )
+
+    test_time = get_timestamp(test)
+
+    print(
+        f"  Time: {test_time.isoformat()}"
+        if test_time is not None
+        else "  Time: Unknown"
+    )
+
+
+def print_session_info(
+    session: JsonObject,
+) -> None:
+    print(
+        "  Related change session: YES"
+    )
+    print(
+        f"  Session: "
+        f"{session.get('session_number')}"
+    )
+    print(
+        f"  Start: "
+        f"{session.get('started_at')}"
+    )
+    print(
+        f"  End: "
+        f"{session.get('ended_at')}"
+    )
+
+    session_files = get_session_files(
+        session
+    )
+
+    print("  Changed files:")
+
+    for file_path in sorted(session_files):
+        print(
+            f"    {file_path}"
+        )
+
+
+def print_static_findings(
+    findings: list[JsonObject],
+) -> None:
+    if not findings:
+        return
+
+    print(
+        "  Related static findings:"
+    )
+
+    for finding in findings:
+        severity = finding.get(
+            "severity",
+            "UNKNOWN",
+        )
+
+        message = finding.get(
+            "message",
+            "Unknown finding",
+        )
+
+        file_path = finding.get(
+            "file",
+            "Unknown file",
+        )
+
+        line = finding.get(
+            "line"
+        )
+
+        if line is not None:
+            print(
+                f"    [{severity}] "
+                f"{file_path}:{line} - "
+                f"{message}"
+            )
+        else:
+            print(
+                f"    [{severity}] "
+                f"{file_path} - "
+                f"{message}"
+            )
+
+
+def print_evidence(
+    records: list[JsonObject],
+) -> None:
+    print()
+    print("=" * 50)
+    print(
+        "AI DEVELOPER OVERSEER - EVIDENCE"
+    )
+    print("=" * 50)
+
+    if not records:
+        print()
+        print("No test evidence found.")
+        return
+
+    for index, record in enumerate(
+        records,
+        start=1,
+    ):
+        print()
+        print(
+            f"Evidence #{index}"
+        )
+
+        test_value = record.get(
+            "test"
+        )
+
+        test = to_json_object(
+            test_value
+        )
+
+        if test is not None:
+            print_test_info(test)
+
+        session_value = record.get(
+            "change_session"
+        )
+
+        session = to_json_object(
+            session_value
+        )
+
+        if session is not None:
+            print_session_info(
+                session
+            )
+        else:
+            print(
+                "  Related change session: NO"
+            )
+
+        error_count = get_list_length(
+            record,
+            "errors",
+        )
+
+        print(
+            f"  Related errors: "
+            f"{error_count}"
+        )
+
+        static_findings_value = (
+            record.get(
+                "static_analysis"
+            )
+        )
+
+        static_findings: list[
+            JsonObject
+        ] = []
+
+        if isinstance(
+            static_findings_value,
+            list,
+        ):
+            for finding_value in cast(
+                list[object],
+                static_findings_value,
+            ):
+                finding = to_json_object(
+                    finding_value
+                )
+
+                if finding is not None:
+                    static_findings.append(
+                        finding
+                    )
+
+        print(
+            "  Related static findings: "
+            f"{len(static_findings)}"
+        )
+
+        print_static_findings(
+            static_findings
+        )
+
+        relationship = get_string(
+            record,
+            "relationship",
+        )
+
+        print(
+            f"  Relationship: "
+            f"{relationship}"
+        )
+
+
+def main() -> None:
+    sessions = load_jsonl(
+        SESSIONS_FILE
+    )
+
+    tests = load_jsonl(
+        TEST_RESULTS_FILE
+    )
+
+    errors = load_jsonl(
+        ERRORS_FILE
+    )
+
+    static_analysis = load_jsonl(
+        STATIC_ANALYSIS_FILE
+    )
+
+    static_findings = get_static_findings(
+        static_analysis
+    )
+
+    evidence = build_evidence(
+        sessions=sessions,
+        tests=tests,
+        errors=errors,
+        static_findings=static_findings,
+    )
+
+    write_evidence(evidence)
+    print_evidence(evidence)
+
+    print()
+    print(
+        f"Evidence file: "
+        f"{EVIDENCE_FILE}"
+    )
 
 
 if __name__ == "__main__":

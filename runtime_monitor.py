@@ -11,6 +11,7 @@ LOG_FOLDER = PROJECT_FOLDER / "logs"
 ERROR_LOG_FILE = LOG_FOLDER / "errors.jsonl"
 
 NO_ERROR_EXIT_CODES = {0, 5}
+COMMAND_TIMEOUT_SECONDS = 300
 
 
 @dataclass
@@ -46,7 +47,33 @@ def run_command(command: list[str]) -> CommandResult:
             capture_output=True,
             text=True,
             check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
         )
+
+    except subprocess.TimeoutExpired as error:
+        duration = time.perf_counter() - start_time
+
+        output = (
+            "Command timed out after "
+            f"{COMMAND_TIMEOUT_SECONDS} seconds."
+        )
+
+        if error.stdout:
+            output += f"\n{error.stdout}"
+
+        if error.stderr:
+            output += f"\n{error.stderr}"
+
+        result = CommandResult(
+            command=command,
+            exit_code=-1,
+            output=output,
+            duration=duration,
+        )
+
+        write_error(result)
+        return result
+
     except OSError as error:
         duration = time.perf_counter() - start_time
 

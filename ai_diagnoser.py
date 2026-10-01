@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol, TypeAlias, cast
 
 from google import genai
 from google.genai import types
@@ -14,11 +15,23 @@ PROJECT_FOLDER = Path(__file__).resolve().parent
 LOG_FOLDER = PROJECT_FOLDER / "logs"
 
 EVIDENCE_FILE = LOG_FOLDER / "evidence.jsonl"
+CONTEXT_FILE = LOG_FOLDER / "project_context.jsonl"
 DIAGNOSES_FILE = LOG_FOLDER / "diagnoses.jsonl"
 
 MODEL_NAME = "gemini-3.5-flash-lite"
 
-JsonObject = dict[str, object]
+
+JsonValue: TypeAlias = (
+    None
+    | bool
+    | int
+    | float
+    | str
+    | list["JsonValue"]
+    | dict[str, "JsonValue"]
+)
+
+JsonObject: TypeAlias = dict[str, JsonValue]
 
 
 class ModelsAPI(Protocol):
@@ -32,53 +45,90 @@ class ModelsAPI(Protocol):
         ...
 
 
+class ExactChange(BaseModel):
+    file: str | None = Field(...)
+    line: int | None = Field(...)
+    old_text: str | None = Field(...)
+    new_text: str | None = Field(...)
+
+
 class Diagnosis(BaseModel):
-    status: Literal["NO_TESTS", "FAILED", "PASSED", "UNKNOWN"] = Field(
-        description="The test status from the evidence."
-    )
-    diagnosis: str = Field(
-        description="A concise explanation of what the evidence indicates."
-    )
-    likely_cause: str = Field(
-        description="The most likely cause based only on the supplied evidence."
-    )
-    file: str | None = Field(
-        description="The file most directly associated with the problem, if known."
-    )
-    line: int | None = Field(
-        description="The relevant source-code line number, if known."
-    )
-    confidence: Literal["LOW", "MEDIUM", "HIGH"] = Field(
-        description="Confidence in the diagnosis based on the available evidence."
-    )
-    evidence: list[str] = Field(
-        description="Specific pieces of evidence supporting the diagnosis."
-    )
-    next_step: str = Field(
-        description="The next investigation or debugging step the developer should take."
-    )
+    status: Literal[
+        "NO_TESTS",
+        "FAILED",
+        "PASSED",
+        "UNKNOWN",
+    ] = Field(...)
+
+    diagnosis: str = Field(...)
+    likely_cause: str = Field(...)
+
+    file: str | None = Field(...)
+    line: int | None = Field(...)
+
+    confidence: Literal[
+        "LOW",
+        "MEDIUM",
+        "HIGH",
+    ] = Field(...)
+
+    evidence: list[str] = Field(...)
+    next_step: str = Field(...)
+
+    proposed_change: str = Field(...)
+    affected_files: list[str] = Field(...)
+
+    change_size: Literal[
+        "NONE",
+        "SMALL",
+        "MEDIUM",
+        "LARGE",
+    ] = Field(...)
+
+    exact_change: ExactChange = Field(...)
 
 
-def to_json_object(value: object) -> JsonObject | None:
-    if not isinstance(value, dict):
+def to_json_object(
+    value: object,
+) -> JsonObject | None:
+    if not isinstance(
+        value,
+        dict,
+    ):
         return None
 
-    object_value = cast(dict[object, object], value)
+    object_value = cast(
+        dict[object, object],
+        value,
+    )
 
     for key in object_value:
-        if not isinstance(key, str):
+        if not isinstance(
+            key,
+            str,
+        ):
             return None
 
-    return cast(JsonObject, value)
+    return cast(
+        JsonObject,
+        value,
+    )
 
 
-def load_evidence() -> list[JsonObject]:
-    if not EVIDENCE_FILE.exists():
+def load_jsonl(
+    path: Path,
+) -> list[JsonObject]:
+    if not path.exists():
         return []
 
-    evidence: list[JsonObject] = []
+    records: list[
+        JsonObject
+    ] = []
 
-    with EVIDENCE_FILE.open("r", encoding="utf-8") as file:
+    with path.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
         for line in file:
             line = line.strip()
 
@@ -86,16 +136,41 @@ def load_evidence() -> list[JsonObject]:
                 continue
 
             try:
-                value: object = json.loads(line)
+                value: object = (
+                    json.loads(line)
+                )
             except json.JSONDecodeError:
                 continue
 
-            record = to_json_object(value)
+            record = to_json_object(
+                value
+            )
 
             if record is not None:
-                evidence.append(record)
+                records.append(record)
 
-    return evidence
+    return records
+
+
+def normalize_path(
+    path: str,
+) -> str:
+    return path.replace(
+        "\\",
+        "/",
+    ).lstrip("./")
+
+
+def load_evidence() -> list[JsonObject]:
+    return load_jsonl(
+        EVIDENCE_FILE
+    )
+
+
+def load_project_context() -> list[JsonObject]:
+    return load_jsonl(
+        CONTEXT_FILE
+    )
 
 
 def get_object(
@@ -103,19 +178,31 @@ def get_object(
     key: str,
 ) -> JsonObject | None:
     value = record.get(key)
-    return to_json_object(value)
+
+    if not isinstance(
+        value,
+        dict,
+    ):
+        return None
+
+    return to_json_object(
+        value
+    )
 
 
 def get_string(
     record: JsonObject,
     key: str,
-) -> str | None:
+) -> str:
     value = record.get(key)
 
-    if isinstance(value, str):
+    if isinstance(
+        value,
+        str,
+    ):
         return value
 
-    return None
+    return ""
 
 
 def get_int(
@@ -124,7 +211,10 @@ def get_int(
 ) -> int | None:
     value = record.get(key)
 
-    if isinstance(value, int) and not isinstance(value, bool):
+    if isinstance(
+        value,
+        int,
+    ):
         return value
 
     return None
@@ -132,23 +222,261 @@ def get_int(
 
 def get_test_status(
     evidence: JsonObject,
-) -> str | None:
+) -> str:
     test = get_object(
         evidence,
         "test",
     )
 
     if test is None:
-        return None
+        return "UNKNOWN"
 
-    return get_string(
+    status = get_string(
         test,
         "status",
     )
 
+    if status:
+        return status
+
+    return "UNKNOWN"
+
+
+def get_affected_file(
+    evidence: JsonObject,
+) -> str | None:
+    test = get_object(
+        evidence,
+        "test",
+    )
+
+    if test is not None:
+        failures = test.get(
+            "failures"
+        )
+
+        if isinstance(
+            failures,
+            list,
+        ):
+            for failure in failures:
+                if not isinstance(
+                    failure,
+                    dict,
+                ):
+                    continue
+
+                failure_object = (
+                    to_json_object(
+                        failure
+                    )
+                )
+
+                if failure_object is None:
+                    continue
+
+                file = get_string(
+                    failure_object,
+                    "file",
+                )
+
+                if file:
+                    return file
+
+    errors = evidence.get(
+        "errors"
+    )
+
+    if isinstance(
+        errors,
+        list,
+    ):
+        for error in errors:
+            if not isinstance(
+                error,
+                dict,
+            ):
+                continue
+
+            error_object = (
+                to_json_object(
+                    error
+                )
+            )
+
+            if error_object is None:
+                continue
+
+            file = get_string(
+                error_object,
+                "file",
+            )
+
+            if file:
+                return file
+
+    static_analysis = evidence.get(
+        "static_analysis"
+    )
+
+    if isinstance(
+        static_analysis,
+        list,
+    ):
+        for finding in static_analysis:
+            if not isinstance(
+                finding,
+                dict,
+            ):
+                continue
+
+            finding_object = (
+                to_json_object(
+                    finding
+                )
+            )
+
+            if finding_object is None:
+                continue
+
+            file = get_string(
+                finding_object,
+                "file",
+            )
+
+            if file:
+                return file
+
+    change_session = get_object(
+        evidence,
+        "change_session",
+    )
+
+    if change_session is not None:
+        files = change_session.get(
+            "files"
+        )
+
+        if isinstance(
+            files,
+            list,
+        ):
+            for file in files:
+                if isinstance(
+                    file,
+                    str,
+                ):
+                    return file
+
+    return None
+
+
+def get_context_for_file(
+    context_records: list[JsonObject],
+    file_path: str,
+) -> JsonObject | None:
+    normalized_target = normalize_path(
+        file_path
+    )
+
+    for record in context_records:
+        path = get_string(
+            record,
+            "path",
+        )
+
+        if not path:
+            continue
+
+        if (
+            normalize_path(path)
+            == normalized_target
+        ):
+            return record
+
+    return None
+
+
+def get_relevant_context(
+    evidence: JsonObject,
+    context_records: list[JsonObject],
+) -> list[JsonObject]:
+    relevant_context: list[
+        JsonObject
+    ] = []
+
+    affected_file = get_affected_file(
+        evidence
+    )
+
+    if affected_file:
+        context = (
+            get_context_for_file(
+                context_records,
+                affected_file,
+            )
+        )
+
+        if context is not None:
+            relevant_context.append(
+                context
+            )
+
+    change_session = get_object(
+        evidence,
+        "change_session",
+    )
+
+    if change_session is not None:
+        files = change_session.get(
+            "files"
+        )
+
+        if isinstance(
+            files,
+            list,
+        ):
+            for file in files:
+                if not isinstance(
+                    file,
+                    str,
+                ):
+                    continue
+
+                context = (
+                    get_context_for_file(
+                        context_records,
+                        file,
+                    )
+                )
+
+                if context is None:
+                    continue
+
+                already_added = any(
+                    get_string(
+                        existing,
+                        "path",
+                    )
+                    == get_string(
+                        context,
+                        "path",
+                    )
+                    for existing
+                    in relevant_context
+                )
+
+                if not already_added:
+                    relevant_context.append(
+                        context
+                    )
+
+    return relevant_context
+
 
 def build_prompt(
     evidence: JsonObject,
+    context_records: list[JsonObject],
 ) -> str:
     evidence_json = json.dumps(
         evidence,
@@ -156,70 +484,116 @@ def build_prompt(
         ensure_ascii=False,
     )
 
+    context_json = json.dumps(
+        context_records,
+        indent=2,
+        ensure_ascii=False,
+    )
+
     return f"""
-You are the AI Developer Overseer.
+You are an AI Developer Overseer.
 
-Your job is to diagnose a software problem using ONLY the supplied evidence.
+Analyze the supplied project evidence and source code.
 
-Do not invent files, line numbers, errors, causes, or events that are not
-supported by the evidence.
+Your job is to diagnose software problems and propose a change when
+the supplied evidence supports one.
 
-Distinguish clearly between confirmed facts and likely causes.
+Rules:
+- Use only the supplied evidence and source context.
+- Do not invent files, errors, test results, or source code.
+- Identify the most likely cause.
+- Identify the affected file when possible.
+- Identify the affected line when possible.
+- Give a confidence level.
+- Give a practical next step.
+- If a change is needed, describe the proposed change clearly.
+- Do not write replacement code unless it is placed inside the
+  exact_change fields.
+- Do not produce a full rewritten file.
+- Do not propose unrelated improvements.
+- Do not change architecture unless the evidence requires it.
+- If there is no supported change, use change_size "NONE".
+- affected_files must contain only files supported by the evidence
+  or supplied source context.
 
-If the evidence is insufficient to identify a cause, say so and use LOW
-confidence.
+Important source-context rule:
+- The supplied source context is the authoritative current source.
+- Do not assume source code that is not included in the context.
+- If the source context contains the affected test or function,
+  inspect it before proposing a change.
+- Do not diagnose a specific implementation as incorrect unless
+  the supplied source supports that conclusion.
 
-The developer wants useful debugging guidance, not a code rewrite.
+Exact change rules:
+- exact_change describes one specific file edit that can be safely
+  applied mechanically.
+- file must identify the exact file being changed.
+- line must identify the relevant line when known.
+- old_text must contain the exact existing text that should be
+  replaced.
+- new_text must contain the exact replacement text.
+- Only provide new_text when the supplied evidence and source
+  context establish exactly what the replacement should be.
+- Never guess a replacement value.
+- If the correct replacement cannot be established from the
+  supplied evidence, set new_text to null.
+- If an exact mechanical edit cannot be established, set the
+  exact_change fields to null where appropriate.
+- The change applier will refuse to modify files when new_text
+  is missing.
+- An approved permission does not give permission to guess.
 
-Analyze this complete evidence record:
+change_size means:
+NONE = no change should be made.
+SMALL = a localized change affecting a small part of the project.
+MEDIUM = a change affecting multiple related parts.
+LARGE = a substantial change affecting project architecture or
+multiple major components.
 
+The proposed change will be shown to the developer for permission.
+Do not assume permission has been granted.
+
+Return only structured data matching the requested schema.
+
+Project evidence:
 {evidence_json}
 
-Return a structured diagnosis containing:
-
-- the test status
-- what happened
-- the most likely cause
-- the affected file if known
-- the affected line if known
-- confidence
-- concrete evidence supporting the diagnosis
-- the next debugging step
+Relevant source context:
+{context_json}
 """.strip()
 
 
 def diagnose_evidence(
-    client: genai.Client,
+    client: ModelsAPI,
     evidence: JsonObject,
+    context_records: list[JsonObject],
 ) -> Diagnosis:
-    prompt = build_prompt(evidence)
-
-    models = cast(
-        ModelsAPI,
-        client.models,
+    prompt = build_prompt(
+        evidence,
+        context_records,
     )
 
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema=Diagnosis,
-    )
-
-    response = models.generate_content(
+    response = client.generate_content(
         model=MODEL_NAME,
         contents=prompt,
-        config=config,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=Diagnosis,
+            automatic_function_calling=(
+                types.AutomaticFunctionCallingConfig(
+                    disable=True,
+                )
+            ),
+        ),
     )
 
-    parsed = response.parsed
+    if not response.text:
+        raise RuntimeError(
+            "AI returned an empty response."
+        )
 
-    if isinstance(parsed, Diagnosis):
-        return parsed
-
-    if isinstance(parsed, dict):
-        return Diagnosis.model_validate(parsed)
-
-    raise RuntimeError(
-        "Gemini returned an unexpected response type."
+    return Diagnosis.model_validate_json(
+        response.text
     )
 
 
@@ -227,20 +601,36 @@ def write_diagnosis(
     evidence: JsonObject,
     diagnosis: Diagnosis,
 ) -> None:
-    DIAGNOSES_FILE.parent.mkdir(
+    LOG_FOLDER.mkdir(
         parents=True,
         exist_ok=True,
     )
 
+    diagnosis_data = (
+        diagnosis.model_dump()
+    )
+
     record: JsonObject = {
-        "timestamp": get_string(
+        "run_id": get_string(
+            evidence,
+            "run_id",
+        ),
+        "timestamp": datetime.now(
+            timezone.utc
+        ).isoformat(
+            timespec="milliseconds"
+        ),
+        "test_timestamp": get_string(
             evidence,
             "timestamp",
         ),
         "test_status": get_test_status(
             evidence,
         ),
-        "diagnosis": diagnosis.model_dump(),
+        "diagnosis": cast(
+            JsonValue,
+            diagnosis_data,
+        ),
     }
 
     with DIAGNOSES_FILE.open(
@@ -257,78 +647,165 @@ def write_diagnosis(
 
 
 def print_diagnosis(
-    evidence_number: int,
-    evidence: JsonObject,
     diagnosis: Diagnosis,
 ) -> None:
-    timestamp = get_string(
-        evidence,
-        "timestamp",
+    print()
+    print("=" * 50)
+    print("AI DIAGNOSIS")
+    print("=" * 50)
+
+    print(
+        f"Status: {diagnosis.status}"
+    )
+
+    print(
+        f"Diagnosis: "
+        f"{diagnosis.diagnosis}"
+    )
+
+    print(
+        f"Likely cause: "
+        f"{diagnosis.likely_cause}"
+    )
+
+    print(
+        f"File: "
+        f"{diagnosis.file or 'Unknown'}"
+    )
+
+    print(
+        f"Line: "
+        f"{diagnosis.line or 'Unknown'}"
+    )
+
+    print(
+        f"Confidence: "
+        f"{diagnosis.confidence}"
     )
 
     print()
-    print("=" * 50)
-    print(f"Diagnosis #{evidence_number}")
-    print("=" * 50)
-    print(f"Time: {timestamp}")
-    print(f"Status: {diagnosis.status}")
-    print(f"Diagnosis: {diagnosis.diagnosis}")
-    print(f"Likely cause: {diagnosis.likely_cause}")
-    print(f"File: {diagnosis.file}")
-    print(f"Line: {diagnosis.line}")
-    print(f"Confidence: {diagnosis.confidence}")
-
     print("Evidence:")
 
-    for item in diagnosis.evidence:
-        print(f"  - {item}")
+    for evidence_number, evidence_item in enumerate(
+        diagnosis.evidence,
+        start=1,
+    ):
+        print(
+            f"{evidence_number}. "
+            f"{evidence_item}"
+        )
 
-    print(f"Next step: {diagnosis.next_step}")
+    print()
+
+    print(
+        f"Next step: "
+        f"{diagnosis.next_step}"
+    )
+
+    print()
+
+    print(
+        "Proposed change:"
+    )
+
+    print(
+        diagnosis.proposed_change
+    )
+
+    print()
+
+    print(
+        "Affected files:"
+    )
+
+    if diagnosis.affected_files:
+        for file_path in (
+            diagnosis.affected_files
+        ):
+            print(
+                f"  {file_path}"
+            )
+    else:
+        print(
+            "  None"
+        )
+
+    print()
+
+    print(
+        "Exact change:"
+    )
+
+    print(
+        f"File: "
+        f"{diagnosis.exact_change.file or 'None'}"
+    )
+
+    print(
+        f"Line: "
+        f"{diagnosis.exact_change.line or 'None'}"
+    )
+
+    print(
+        f"Old text: "
+        f"{diagnosis.exact_change.old_text or 'None'}"
+    )
+
+    print(
+        f"New text: "
+        f"{diagnosis.exact_change.new_text or 'None'}"
+    )
+
+    print()
+
+    print(
+        f"Change size: "
+        f"{diagnosis.change_size}"
+    )
+
+    print("=" * 50)
 
 
 def main() -> None:
-    print()
-    print("=" * 50)
-    print("AI DEVELOPER OVERSEER - AI DIAGNOSIS")
-    print("=" * 50)
+    evidence_records = load_evidence()
+
+    if not evidence_records:
+        print(
+            "No evidence found."
+        )
+        return
+
+    context_records = (
+        load_project_context()
+    )
 
     api_key = os.getenv(
         "GEMINI_API_KEY"
     )
 
     if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY environment variable is not set."
+        print(
+            "GEMINI_API_KEY is not set."
         )
-
-    evidence_records = load_evidence()
-
-    if not evidence_records:
-        print("No evidence records found.")
         return
 
     client = genai.Client(
         api_key=api_key,
     )
 
-    for evidence_number, evidence in enumerate(
-        evidence_records,
-        start=1,
-    ):
-        status = get_test_status(
-            evidence,
-        )
-
-        if status not in {
-            "FAILED",
-            "NO_TESTS",
-        }:
-            continue
-
+    for evidence in evidence_records[-1:]:
         try:
+            relevant_context = (
+                get_relevant_context(
+                    evidence,
+                    context_records,
+                )
+            )
+
             diagnosis = diagnose_evidence(
-                client,
+                client.models,
                 evidence,
+                relevant_context,
             )
 
             write_diagnosis(
@@ -337,24 +814,14 @@ def main() -> None:
             )
 
             print_diagnosis(
-                evidence_number,
-                evidence,
-                diagnosis,
+                diagnosis
             )
 
         except Exception as error:
-            print()
             print(
-                f"Diagnosis #{evidence_number} failed."
+                f"Failed to diagnose evidence: "
+                f"{error}"
             )
-            print(
-                f"Error: {error}"
-            )
-
-    print()
-    print(
-        f"Diagnosis file: {DIAGNOSES_FILE}"
-    )
 
 
 if __name__ == "__main__":
