@@ -3,6 +3,17 @@ from pathlib import Path
 from typing import cast
 import json
 
+from evidence_models import (
+    EvidenceGroup,
+    EvidenceRecord,
+    EvidenceRelationship,
+    append_evidence_group,
+    append_evidence_relationship,
+    make_evidence_group,
+    make_evidence_relationship,
+    read_evidence_records,
+)
+
 
 PROJECT_FOLDER = Path(__file__).resolve().parent
 LOG_FOLDER = PROJECT_FOLDER / "logs"
@@ -12,6 +23,8 @@ TEST_RESULTS_FILE = LOG_FOLDER / "test_results.jsonl"
 ERRORS_FILE = LOG_FOLDER / "errors.jsonl"
 STATIC_ANALYSIS_FILE = LOG_FOLDER / "static_analysis.jsonl"
 EVIDENCE_FILE = LOG_FOLDER / "evidence.jsonl"
+RELATIONSHIP_FILE = LOG_FOLDER / "evidence_relationships.jsonl"
+GROUP_FILE = LOG_FOLDER / "evidence_groups.jsonl"
 
 CORRELATION_WINDOW_SECONDS = 300
 
@@ -59,6 +72,328 @@ def load_jsonl(path: Path) -> list[JsonObject]:
     except OSError:
         return []
 
+    return records
+
+
+def _normalize_evidence_record(raw: JsonObject) -> EvidenceRecord | None:
+    evidence_id = raw.get("evidence_id")
+    if not isinstance(evidence_id, str):
+        return None
+
+    message = raw.get("message")
+    if not isinstance(message, str):
+        return None
+
+    project_scope = raw.get("project_scope")
+    if not isinstance(project_scope, str):
+        project_scope = "project-root"
+
+    affected_files = raw.get("affected_files")
+    affected: list[str] = []
+    if isinstance(affected_files, list):
+        for value in affected_files:
+            if isinstance(value, str):
+                affected.append(value)
+
+    timestamp = raw.get("timestamp")
+    if not isinstance(timestamp, str):
+        timestamp = datetime.now().isoformat(timespec="microseconds")
+
+    record: EvidenceRecord = {
+        "evidence_id": evidence_id,
+        "project_scope": project_scope,
+        "affected_files": affected,
+        "message": message,
+        "correlation_keys": [],
+        "related_evidence_ids": [],
+        "timestamp": timestamp,
+    }
+
+    if isinstance(raw.get("tool_name"), str):
+        record["tool_name"] = raw["tool_name"]
+    if isinstance(raw.get("evidence_type"), str):
+        record["evidence_type"] = raw["evidence_type"]
+    if isinstance(raw.get("proof_strength"), str):
+        record["proof_strength"] = raw["proof_strength"]
+    if isinstance(raw.get("status"), str):
+        record["status"] = raw["status"]
+    if isinstance(raw.get("run_id"), str):
+        record["run_id"] = raw["run_id"]
+    if isinstance(raw.get("transaction_id"), str):
+        record["transaction_id"] = raw["transaction_id"]
+    if isinstance(raw.get("code_location"), str):
+        record["code_location"] = raw["code_location"]
+    if isinstance(raw.get("error_signature"), str):
+        record["error_signature"] = raw["error_signature"]
+    if isinstance(raw.get("severity"), str):
+        record["severity"] = raw["severity"]
+    if isinstance(raw.get("raw_reference"), str):
+        record["raw_reference"] = raw["raw_reference"]
+    if isinstance(raw.get("availability_note"), str):
+        record["availability_note"] = raw["availability_note"]
+    if isinstance(raw.get("language"), str):
+        record["language"] = raw["language"]
+    if isinstance(raw.get("tool_version"), str):
+        record["tool_version"] = raw["tool_version"]
+    if isinstance(raw.get("correlation_keys"), list):
+        record["correlation_keys"] = [
+            value for value in raw["correlation_keys"] if isinstance(value, str)
+        ]
+    if isinstance(raw.get("related_evidence_ids"), list):
+        record["related_evidence_ids"] = [
+            value for value in raw["related_evidence_ids"] if isinstance(value, str)
+        ]
+    return record
+
+
+def _record_timestamp(record: EvidenceRecord) -> datetime | None:
+    value = record.get("timestamp")
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _evidence_files(record: EvidenceRecord) -> set[str]:
+    files = record.get("affected_files", [])
+    if not isinstance(files, list):
+        return set()
+    return {value for value in files if isinstance(value, str)}
+
+
+def _relationship_strength(first: EvidenceRecord, second: EvidenceRecord) -> str:
+    values = [
+        first.get("proof_strength", "LOW"),
+        second.get("proof_strength", "LOW"),
+    ]
+    if any(value == "OBSERVED" for value in values):
+        return "OBSERVED"
+    if any(value == "HIGH" for value in values):
+        return "HIGH"
+    if any(value == "MEDIUM" for value in values):
+        return "MEDIUM"
+    if any(value == "LOW" for value in values):
+        return "LOW"
+    return "NONE"
+
+
+def _relationship_key(
+    source: EvidenceRecord,
+    target: EvidenceRecord,
+    relationship_type: str,
+    reason: str,
+) -> str:
+    return f"{source['evidence_id']}|{target['evidence_id']}|{relationship_type}|{reason}"
+
+
+def correlate_evidence_records(
+    records: list[EvidenceRecord],
+) -> tuple[list[EvidenceRelationship], list[EvidenceGroup]]:
+    if not records:
+        return [], []
+
+    seen: set[str] = set()
+    relationships: list[EvidenceRelationship] = []
+
+    for index, left in enumerate(records):
+        for right in records[index + 1:]:
+            if left["evidence_id"] == right["evidence_id"]:
+                continue
+
+            pair_signals: list[tuple[str, str, list[str]]] = []
+
+            left_run = left.get("run_id")
+            right_run = right.get("run_id")
+            if isinstance(left_run, str) and left_run and left_run == right_run:
+                pair_signals.append(("RELATED_TO", "shared run_id", ["shared_run_id"]))
+
+            left_txn = left.get("transaction_id")
+            right_txn = right.get("transaction_id")
+            if isinstance(left_txn, str) and left_txn and left_txn == right_txn:
+                pair_signals.append(("RELATED_TO_CHANGE", "shared transaction_id", ["shared_transaction_id"]))
+
+            shared_files = _evidence_files(left).intersection(_evidence_files(right))
+            if shared_files:
+                pair_signals.append(("RELATED_TO", "shared affected file", ["shared_affected_file", *sorted(shared_files)]))
+
+            if left.get("code_location") == right.get("code_location") and isinstance(left.get("code_location"), str):
+                pair_signals.append(("RELATED_TO", "same code location", ["same_code_location"]))
+
+            if left.get("error_signature") and left.get("error_signature") == right.get("error_signature"):
+                pair_signals.append(("RELATED_TO", "matching error signature", ["matching_error_signature"]))
+
+            left_ts = _record_timestamp(left)
+            right_ts = _record_timestamp(right)
+            if left_ts is not None and right_ts is not None:
+                if right_ts > left_ts:
+                    pair_signals.append(("OBSERVED_BEFORE", "temporal ordering", ["temporal_before"]))
+                elif left_ts > right_ts:
+                    pair_signals.append(("OBSERVED_AFTER", "temporal ordering", ["temporal_after"]))
+
+            if (
+                left.get("status") == "UNAVAILABLE"
+                and right.get("status") == "AVAILABLE"
+                and bool(shared_files)
+            ):
+                pair_signals.append(("CONTRADICTS", "tool availability conflicts with observed evidence", ["availability_conflict"]))
+
+            if not pair_signals:
+                continue
+
+            for relationship_type, reason, signals in pair_signals:
+                relationship_id = _relationship_key(left, right, relationship_type, reason)
+                if relationship_id in seen:
+                    continue
+                seen.add(relationship_id)
+                relationship = make_evidence_relationship(
+                    source_evidence_id=left["evidence_id"],
+                    target_evidence_id=right["evidence_id"],
+                    relationship_type=relationship_type,
+                    reason=reason,
+                    signals=signals,
+                    strength=_relationship_strength(left, right),
+                    timestamp=left.get("timestamp") if isinstance(left.get("timestamp"), str) else right.get("timestamp"),
+                    run_id=left.get("run_id") if isinstance(left.get("run_id"), str) else right.get("run_id"),
+                    transaction_id=left.get("transaction_id") if isinstance(left.get("transaction_id"), str) else right.get("transaction_id"),
+                    source_file=next(iter(shared_files), left.get("code_location") if isinstance(left.get("code_location"), str) else None),
+                    target_file=next(iter(shared_files), right.get("code_location") if isinstance(right.get("code_location"), str) else None),
+                )
+                relationships.append(relationship)
+
+    if not relationships:
+        return [], []
+
+    graph: dict[str, set[str]] = {}
+    for relationship in relationships:
+        source_id = relationship["source_evidence_id"]
+        target_id = relationship["target_evidence_id"]
+        graph.setdefault(source_id, set()).add(target_id)
+        graph.setdefault(target_id, set()).add(source_id)
+
+    visited: set[str] = set()
+    groups: list[EvidenceGroup] = []
+    for evidence_id in sorted(graph):
+        if evidence_id in visited:
+            continue
+        queue = [evidence_id]
+        component: list[str] = []
+        while queue:
+            current = queue.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            for neighbor in sorted(graph.get(current, set())):
+                if neighbor not in visited:
+                    queue.append(neighbor)
+
+        if len(component) < 2:
+            continue
+
+        component_set = set(component)
+        component_relationships = [
+            relationship for relationship in relationships
+            if relationship["source_evidence_id"] in component_set
+            and relationship["target_evidence_id"] in component_set
+        ]
+
+        component_records = [record for record in records if record["evidence_id"] in component_set]
+        timestamps = [
+            _record_timestamp(record)
+            for record in component_records
+            if _record_timestamp(record) is not None
+        ]
+        first_seen = min(timestamps) if timestamps else None
+        last_seen = max(timestamps) if timestamps else None
+
+        run_ids = {
+            record.get("run_id") for record in component_records if isinstance(record.get("run_id"), str)
+        }
+        transactions = {
+            record.get("transaction_id") for record in component_records if isinstance(record.get("transaction_id"), str)
+        }
+        group = make_evidence_group(
+            evidence_ids=sorted(component),
+            relationship_ids=[relationship["relationship_id"] for relationship in component_relationships],
+            summary=f"Evidence cluster with {len(component)} related records",
+            first_seen=(first_seen.isoformat() if first_seen is not None else datetime.now().isoformat(timespec="microseconds")),
+            last_seen=(last_seen.isoformat() if last_seen is not None else datetime.now().isoformat(timespec="microseconds")),
+            contradiction_count=sum(1 for relationship in component_relationships if relationship["relationship_type"] == "CONTRADICTS"),
+            run_id=next(iter(sorted(run_ids)), None),
+            transaction_id=next(iter(sorted(transactions)), None),
+            temporal_context="AROUND" if first_seen is not None and last_seen is not None else "UNKNOWN",
+        )
+        groups.append(group)
+
+    return relationships, groups
+
+
+def persist_correlated_evidence(
+    records: list[EvidenceRecord],
+    *,
+    relationship_path: str | Path = RELATIONSHIP_FILE,
+    group_path: str | Path = GROUP_FILE,
+) -> tuple[list[EvidenceRelationship], list[EvidenceGroup]]:
+    relationships, groups = correlate_evidence_records(records)
+    LOG_FOLDER.mkdir(parents=True, exist_ok=True)
+    relationship_file = Path(relationship_path)
+    group_file = Path(group_path)
+
+    seen_relationships: set[str] = set()
+    if relationship_file.exists():
+        for existing in read_evidence_records(relationship_file):
+            if "relationship_id" in existing:
+                seen_relationships.add(str(existing["relationship_id"]))
+
+    for relationship in relationships:
+        relation_id = relationship["relationship_id"]
+        if relation_id in seen_relationships:
+            continue
+        append_evidence_relationship(relationship_file, relationship)
+        seen_relationships.add(relation_id)
+
+    seen_groups: set[str] = set()
+    if group_file.exists():
+        for existing in read_evidence_records(group_file):
+            if "group_id" in existing:
+                seen_groups.add(str(existing["group_id"]))
+
+    for group in groups:
+        group_id = group["group_id"]
+        if group_id in seen_groups:
+            continue
+        append_evidence_group(group_file, group)
+        seen_groups.add(group_id)
+
+    return relationships, groups
+
+
+def load_correlated_evidence(
+    *,
+    relationship_path: str | Path = RELATIONSHIP_FILE,
+    group_path: str | Path = GROUP_FILE,
+) -> tuple[list[EvidenceRelationship], list[EvidenceGroup]]:
+    return (
+        read_evidence_relationships(Path(relationship_path)),
+        read_evidence_groups(Path(group_path)),
+    )
+
+
+def read_evidence_relationships(path: Path) -> list[EvidenceRelationship]:
+    records: list[EvidenceRelationship] = []
+    for entry in load_jsonl(path):
+        if isinstance(entry, dict) and "relationship_id" in entry:
+            records.append(cast(EvidenceRelationship, entry))
+    return records
+
+
+def read_evidence_groups(path: Path) -> list[EvidenceGroup]:
+    records: list[EvidenceGroup] = []
+    for entry in load_jsonl(path):
+        if isinstance(entry, dict) and "group_id" in entry:
+            records.append(cast(EvidenceGroup, entry))
     return records
 
 

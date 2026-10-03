@@ -13,6 +13,15 @@ LOG_FOLDER = PROJECT_FOLDER / "logs"
 STATIC_ANALYSIS_FILE = LOG_FOLDER / "static_analysis.jsonl"
 
 
+def resolve_project_root(
+    project_root: str | Path | None = None,
+) -> Path:
+    if project_root is None:
+        return PROJECT_FOLDER
+
+    return Path(project_root).resolve()
+
+
 @dataclass
 class AnalysisFinding:
     tool: str
@@ -41,11 +50,14 @@ def command_exists(command: str) -> bool:
 def run_command(
     command: list[str],
     timeout: int = 30,
+    project_root: str | Path | None = None,
 ) -> tuple[int, str]:
+    root = resolve_project_root(project_root)
+
     try:
         result = subprocess.run(
             command,
-            cwd=PROJECT_FOLDER,
+            cwd=root,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -102,7 +114,11 @@ def parse_luau_output(
 
     return findings
 
-def analyze_luau() -> AnalysisResult:
+def analyze_luau(
+    project_root: str | Path | None = None,
+) -> AnalysisResult:
+    root = resolve_project_root(project_root)
+
     if not command_exists("luau-analyze"):
         return AnalysisResult(
             tool="luau-analyze",
@@ -113,7 +129,7 @@ def analyze_luau() -> AnalysisResult:
         )
 
     luau_files = list(
-        PROJECT_FOLDER.rglob("*.luau")
+        root.rglob("*.luau")
     )
 
     if not luau_files:
@@ -128,12 +144,12 @@ def analyze_luau() -> AnalysisResult:
     command = [
         "luau-analyze",
         *[
-            str(path.relative_to(PROJECT_FOLDER))
+            str(path.relative_to(root))
             for path in luau_files
         ],
     ]
 
-    exit_code, output = run_command(command)
+    exit_code, output = run_command(command, project_root=root)
 
     return AnalysisResult(
         tool="luau-analyze",
@@ -144,9 +160,12 @@ def analyze_luau() -> AnalysisResult:
     )
 
 
-def analyze_python() -> AnalysisResult:
+def analyze_python(
+    project_root: str | Path | None = None,
+) -> AnalysisResult:
+    root = resolve_project_root(project_root)
     python_files = list(
-        PROJECT_FOLDER.rglob("*.py")
+        root.rglob("*.py")
     )
 
     if not python_files:
@@ -161,9 +180,7 @@ def analyze_python() -> AnalysisResult:
     findings: list[AnalysisFinding] = []
 
     for path in python_files:
-        relative_path = path.relative_to(
-            PROJECT_FOLDER
-        )
+        relative_path = path.relative_to(root)
 
         try:
             source = path.read_text(
@@ -217,7 +234,11 @@ def analyze_python() -> AnalysisResult:
     )
 
 
-def analyze_typescript() -> AnalysisResult:
+def analyze_typescript(
+    project_root: str | Path | None = None,
+) -> AnalysisResult:
+    root = resolve_project_root(project_root)
+
     if not command_exists("tsc"):
         return AnalysisResult(
             tool="tsc",
@@ -228,7 +249,7 @@ def analyze_typescript() -> AnalysisResult:
         )
 
     if not (
-        (PROJECT_FOLDER / "tsconfig.json").exists()
+        (root / "tsconfig.json").exists()
     ):
         return AnalysisResult(
             tool="tsc",
@@ -242,7 +263,8 @@ def analyze_typescript() -> AnalysisResult:
         [
             "tsc",
             "--noEmit",
-        ]
+        ],
+        project_root=root,
     )
 
     findings: list[AnalysisFinding] = []
@@ -275,7 +297,11 @@ def analyze_typescript() -> AnalysisResult:
     )
 
 
-def analyze_javascript() -> AnalysisResult:
+def analyze_javascript(
+    project_root: str | Path | None = None,
+) -> AnalysisResult:
+    root = resolve_project_root(project_root)
+
     if not command_exists("eslint"):
         return AnalysisResult(
             tool="eslint",
@@ -286,8 +312,8 @@ def analyze_javascript() -> AnalysisResult:
         )
 
     javascript_files = [
-        *PROJECT_FOLDER.rglob("*.js"),
-        *PROJECT_FOLDER.rglob("*.jsx"),
+        *root.rglob("*.js"),
+        *root.rglob("*.jsx"),
     ]
 
     if not javascript_files:
@@ -302,12 +328,12 @@ def analyze_javascript() -> AnalysisResult:
     command = [
         "eslint",
         *[
-            str(path.relative_to(PROJECT_FOLDER))
+            str(path.relative_to(root))
             for path in javascript_files
         ],
     ]
 
-    exit_code, output = run_command(command)
+    exit_code, output = run_command(command, project_root=root)
 
     findings = [
         AnalysisFinding(
@@ -333,24 +359,32 @@ def analyze_javascript() -> AnalysisResult:
     )
 
 
-def analyze_project() -> list[AnalysisResult]:
+def analyze_project(
+    project_root: str | Path | None = None,
+) -> list[AnalysisResult]:
+    root = resolve_project_root(project_root)
     return [
-        analyze_luau(),
-        analyze_python(),
-        analyze_typescript(),
-        analyze_javascript(),
+        analyze_luau(root),
+        analyze_python(root),
+        analyze_typescript(root),
+        analyze_javascript(root),
     ]
 
 
 def save_results(
     results: list[AnalysisResult],
+    project_root: str | Path | None = None,
 ) -> None:
-    LOG_FOLDER.mkdir(
+    root = resolve_project_root(project_root)
+    log_folder = root / "logs"
+    static_analysis_file = log_folder / "static_analysis.jsonl"
+
+    log_folder.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    with STATIC_ANALYSIS_FILE.open(
+    with static_analysis_file.open(
         "w",
         encoding="utf-8",
     ) as file:
@@ -366,7 +400,10 @@ def save_results(
 
 def print_results(
     results: list[AnalysisResult],
+    project_root: str | Path | None = None,
 ) -> None:
+    root = resolve_project_root(project_root)
+    static_analysis_file = root / "logs" / "static_analysis.jsonl"
     print()
     print("=" * 50)
     print(
@@ -397,16 +434,23 @@ def print_results(
 
     print()
     print(
-        f"Results: {STATIC_ANALYSIS_FILE}"
+        f"Results: {static_analysis_file}"
     )
     print("=" * 50)
 
 
 def main() -> None:
-    results = analyze_project()
+    import sys
 
-    save_results(results)
-    print_results(results)
+    project_root = (
+        Path(sys.argv[1]).resolve()
+        if len(sys.argv) > 1
+        else PROJECT_FOLDER
+    )
+    results = analyze_project(project_root)
+
+    save_results(results, project_root)
+    print_results(results, project_root)
 
 
 if __name__ == "__main__":

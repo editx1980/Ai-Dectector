@@ -2,6 +2,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 import fnmatch
 import json
+import sys
 import tomllib
 
 
@@ -87,12 +88,17 @@ class ProjectProfile:
     test_strategies: list[TestStrategy]
 
 
-def load_gitignore_patterns() -> list[str]:
-    if not GITIGNORE_FILE.exists():
+def load_gitignore_patterns(
+    project_root: str | Path | None = None,
+) -> list[str]:
+    root = resolve_project_root(project_root)
+    gitignore_file = root / ".gitignore"
+
+    if not gitignore_file.exists():
         return []
 
     try:
-        with GITIGNORE_FILE.open("r", encoding="utf-8") as file:
+        with gitignore_file.open("r", encoding="utf-8") as file:
             patterns: list[str] = []
 
             for line in file:
@@ -112,8 +118,21 @@ def load_gitignore_patterns() -> list[str]:
         return []
 
 
-def normalize_path(path: Path) -> str:
-    relative_path = path.relative_to(PROJECT_FOLDER)
+def resolve_project_root(
+    project_root: str | Path | None = None,
+) -> Path:
+    if project_root is None:
+        return PROJECT_FOLDER
+
+    return Path(project_root).resolve()
+
+
+def normalize_path(
+    path: Path,
+    project_root: str | Path | None = None,
+) -> str:
+    root = resolve_project_root(project_root)
+    relative_path = path.resolve().relative_to(root)
 
     return str(relative_path).replace("\\", "/")
 
@@ -121,8 +140,9 @@ def normalize_path(path: Path) -> str:
 def matches_gitignore_pattern(
     path: Path,
     pattern: str,
+    project_root: str | Path | None = None,
 ) -> bool:
-    relative_path = normalize_path(path)
+    relative_path = normalize_path(path, project_root=project_root)
 
     is_directory_pattern = pattern.endswith("/")
 
@@ -154,9 +174,12 @@ def matches_gitignore_pattern(
 def should_ignore(
     path: Path,
     patterns: list[str],
+    project_root: str | Path | None = None,
 ) -> bool:
+    root = resolve_project_root(project_root)
+
     try:
-        relative_path = path.relative_to(PROJECT_FOLDER)
+        relative_path = path.resolve().relative_to(root)
 
     except ValueError:
         return True
@@ -178,7 +201,7 @@ def should_ignore(
         if not pattern:
             continue
 
-        if matches_gitignore_pattern(path, pattern):
+        if matches_gitignore_pattern(path, pattern, project_root=root):
             ignored = not is_negated
 
     return ignored
@@ -186,14 +209,16 @@ def should_ignore(
 
 def scan_files(
     gitignore_patterns: list[str],
+    project_root: str | Path | None = None,
 ) -> list[Path]:
+    root = resolve_project_root(project_root)
     files: list[Path] = []
 
-    for path in PROJECT_FOLDER.rglob("*"):
+    for path in root.rglob("*"):
         if not path.is_file():
             continue
 
-        if should_ignore(path, gitignore_patterns):
+        if should_ignore(path, gitignore_patterns, project_root=root):
             continue
 
         files.append(path)
@@ -475,23 +500,24 @@ def detect_configuration_files(
 
 def detect_directories(
     gitignore_patterns: list[str],
+    project_root: str | Path | None = None,
 ) -> list[str]:
+    root = resolve_project_root(project_root)
     directories: list[str] = []
 
-    for path in PROJECT_FOLDER.rglob("*"):
+    for path in root.rglob("*"):
         if not path.is_dir():
             continue
 
         if should_ignore(
             path,
             gitignore_patterns,
+            project_root=root,
         ):
             continue
 
         try:
-            relative_path = path.relative_to(
-                PROJECT_FOLDER
-            )
+            relative_path = path.resolve().relative_to(root)
         except ValueError:
             continue
 
@@ -610,8 +636,11 @@ def detect_python_test_strategies(
     return strategies
 
 
-def detect_node_test_strategies() -> list[TestStrategy]:
-    package_file = PROJECT_FOLDER / "package.json"
+def detect_node_test_strategies(
+    project_root: str | Path | None = None,
+) -> list[TestStrategy]:
+    root = resolve_project_root(project_root)
+    package_file = root / "package.json"
 
     if not package_file.exists():
         return []
@@ -656,10 +685,12 @@ def detect_node_test_strategies() -> list[TestStrategy]:
 
 def detect_other_test_strategies(
     files: list[Path],
+    project_root: str | Path | None = None,
 ) -> list[TestStrategy]:
+    root = resolve_project_root(project_root)
     strategies: list[TestStrategy] = []
 
-    if (PROJECT_FOLDER / "Cargo.toml").exists():
+    if (root / "Cargo.toml").exists():
         strategies.append(
             TestStrategy(
                 framework="Cargo test",
@@ -671,7 +702,7 @@ def detect_other_test_strategies(
             )
         )
 
-    if (PROJECT_FOLDER / "go.mod").exists():
+    if (root / "go.mod").exists():
         strategies.append(
             TestStrategy(
                 framework="Go test",
@@ -723,6 +754,7 @@ def detect_other_test_strategies(
 
 def detect_test_strategies(
     files: list[Path],
+    project_root: str | Path | None = None,
 ) -> list[TestStrategy]:
     strategies: list[TestStrategy] = []
 
@@ -731,11 +763,11 @@ def detect_test_strategies(
     )
 
     strategies.extend(
-        detect_node_test_strategies()
+        detect_node_test_strategies(project_root)
     )
 
     strategies.extend(
-        detect_other_test_strategies(files)
+        detect_other_test_strategies(files, project_root)
     )
 
     unique: dict[
@@ -752,11 +784,15 @@ def detect_test_strategies(
     return list(unique.values())
 
 
-def scan_project() -> ProjectProfile:
-    gitignore_patterns = load_gitignore_patterns()
+def scan_project(
+    project_root: str | Path | None = None,
+) -> ProjectProfile:
+    root = resolve_project_root(project_root)
+    gitignore_patterns = load_gitignore_patterns(root)
 
     files = scan_files(
-        gitignore_patterns
+        gitignore_patterns,
+        project_root=root,
     )
 
     languages = detect_languages(files)
@@ -768,7 +804,7 @@ def scan_project() -> ProjectProfile:
     ) = detect_project_markers(files)
 
     return ProjectProfile(
-        path=str(PROJECT_FOLDER),
+        path=str(root),
         total_files=len(files),
         languages=languages,
         primary_language=(
@@ -787,23 +823,30 @@ def scan_project() -> ProjectProfile:
             detect_configuration_files(files)
         ),
         directories=detect_directories(
-            gitignore_patterns
+            gitignore_patterns,
+            project_root=root,
         ),
         test_strategies=detect_test_strategies(
-            files
+            files,
+            project_root=root,
         ),
     )
 
 
 def save_profile(
     profile: ProjectProfile,
+    project_root: str | Path | None = None,
 ) -> None:
-    LOG_FOLDER.mkdir(
+    root = resolve_project_root(project_root)
+    log_folder = root / "logs"
+    profile_file = log_folder / "project_profile.json"
+
+    log_folder.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    with PROFILE_FILE.open(
+    with profile_file.open(
         "w",
         encoding="utf-8",
     ) as file:
@@ -816,7 +859,10 @@ def save_profile(
 
 def print_profile(
     profile: ProjectProfile,
+    project_root: str | Path | None = None,
 ) -> None:
+    root = resolve_project_root(project_root)
+    profile_file = root / "logs" / "project_profile.json"
     print("=" * 50)
     print(
         "AI DEVELOPER OVERSEER - PROJECT DISCOVERY"
@@ -934,10 +980,15 @@ def print_profile(
 
 
 def main() -> None:
-    profile = scan_project()
+    project_root = (
+        Path(sys.argv[1]).resolve()
+        if len(sys.argv) > 1
+        else PROJECT_FOLDER
+    )
+    profile = scan_project(project_root)
 
-    save_profile(profile)
-    print_profile(profile)
+    save_profile(profile, project_root)
+    print_profile(profile, project_root)
 
 
 if __name__ == "__main__":

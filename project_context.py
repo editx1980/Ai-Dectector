@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import sys
 from typing import TypedDict
 
 
@@ -8,6 +9,7 @@ from project_scanner import (
     PROJECT_FOLDER,
     load_gitignore_patterns,
     normalize_path,
+    resolve_project_root,
     scan_files,
     should_ignore,
 )
@@ -47,9 +49,14 @@ class ProjectContextRecord(TypedDict):
     content: str
 
 
-def is_excluded_directory(path: Path) -> bool:
+def is_excluded_directory(
+    path: Path,
+    project_root: str | Path | None = None,
+) -> bool:
+    root = resolve_project_root(project_root)
+
     try:
-        relative_path = path.relative_to(PROJECT_FOLDER)
+        relative_path = path.resolve().relative_to(root)
     except ValueError:
         return True
 
@@ -80,6 +87,7 @@ def read_source_file(
 def create_context_record(
     path: Path,
     content: str,
+    project_root: str | Path | None = None,
 ) -> ProjectContextRecord:
     language = LANGUAGE_EXTENSIONS.get(
         path.suffix.lower()
@@ -89,7 +97,7 @@ def create_context_record(
         language = "Unknown"
 
     return {
-        "path": normalize_path(path),
+        "path": normalize_path(path, project_root=project_root),
         "language": language,
         "lines": len(content.splitlines()),
         "size_bytes": path.stat().st_size,
@@ -99,19 +107,23 @@ def create_context_record(
 
 def collect_source_files(
     gitignore_patterns: list[str],
+    project_root: str | Path | None = None,
 ) -> list[Path]:
+    root = resolve_project_root(project_root)
+    context_file = root / "logs" / "project_context.jsonl"
     source_files: list[Path] = []
 
     for path in scan_files(
-        gitignore_patterns
+        gitignore_patterns,
+        project_root=root,
     ):
         if not path.is_file():
             continue
 
-        if is_excluded_directory(path):
+        if is_excluded_directory(path, project_root=root):
             continue
 
-        if path == CONTEXT_FILE:
+        if path == context_file:
             continue
 
         if not is_source_file(path):
@@ -128,13 +140,14 @@ def collect_source_files(
         if should_ignore(
             path,
             gitignore_patterns,
+            project_root=root,
         ):
             continue
 
         source_files.append(path)
 
     source_files.sort(
-        key=lambda path: normalize_path(path).lower()
+        key=lambda path: normalize_path(path, project_root=root).lower()
     )
 
     return source_files
@@ -142,15 +155,20 @@ def collect_source_files(
 
 def write_context(
     files: list[Path],
+    project_root: str | Path | None = None,
 ) -> int:
-    LOG_FOLDER.mkdir(
+    root = resolve_project_root(project_root)
+    log_folder = root / "logs"
+    context_file = log_folder / "project_context.jsonl"
+
+    log_folder.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     record_count = 0
 
-    with CONTEXT_FILE.open(
+    with context_file.open(
         "w",
         encoding="utf-8",
     ) as output_file:
@@ -163,6 +181,7 @@ def write_context(
             record = create_context_record(
                 path,
                 content,
+                project_root=root,
             )
 
             json.dump(
@@ -177,22 +196,32 @@ def write_context(
     return record_count
 
 
-def build_context() -> int:
+def build_context(
+    project_root: str | Path | None = None,
+) -> int:
+    root = resolve_project_root(project_root)
     gitignore_patterns = (
-        load_gitignore_patterns()
+        load_gitignore_patterns(root)
     )
 
     source_files = collect_source_files(
-        gitignore_patterns
+        gitignore_patterns,
+        project_root=root,
     )
 
     return write_context(
-        source_files
+        source_files,
+        project_root=root,
     )
 
 
 def main() -> None:
-    record_count = build_context()
+    project_root = (
+        Path(sys.argv[1]).resolve()
+        if len(sys.argv) > 1
+        else PROJECT_FOLDER
+    )
+    record_count = build_context(project_root)
 
     print("=" * 50)
     print(
@@ -204,7 +233,7 @@ def main() -> None:
         f"Context records: {record_count}"
     )
     print(
-        f"Output: {CONTEXT_FILE}"
+        f"Output: {project_root / 'logs' / 'project_context.jsonl'}"
     )
     print("-" * 50)
 
