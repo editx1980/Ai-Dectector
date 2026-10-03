@@ -52,6 +52,7 @@ def test_apply_change_rolls_back_when_validation_fails(
 
     def failed_validation(
         _run_id: str,
+        _affected_files: list[str] | None = None,
     ) -> bool:
         return False
 
@@ -377,6 +378,7 @@ def test_approved_permission_allows_change_after_validation(
 
     def successful_validation(
         _run_id: str,
+        _affected_files: list[str] | None = None,
     ) -> bool:
         return True
 
@@ -418,6 +420,7 @@ def _prepare_real_tester_environment(
     *,
     exit_code: int,
     previous_run_id: str,
+    previous_failure_file: str = "rollback_target.txt",
 ) -> None:
     project_dir = tmp_path / "project"
     logs_dir = project_dir / "logs"
@@ -437,16 +440,17 @@ def _prepare_real_tester_environment(
         "import sys; "
         f"sys.exit({exit_code})"
     )
+    command = [
+        "python",
+        "-c",
+        command_script,
+    ]
 
     config_path = project_dir / "overseer.json"
     config_path.write_text(
         json.dumps(
             {
-                "test_command": [
-                    "python",
-                    "-c",
-                    command_script,
-                ]
+                "test_command": command,
             }
         ),
         encoding="utf-8",
@@ -457,7 +461,15 @@ def _prepare_real_tester_environment(
         json.dumps(
             {
                 "run_id": previous_run_id,
-                "status": "PASSED",
+                "status": "FAILED",
+                "command": command,
+                "failures": [
+                    {
+                        "file": previous_failure_file,
+                        "line": 1,
+                        "test": "test_original_failure",
+                    }
+                ],
             }
         )
         + "\n",
@@ -499,7 +511,8 @@ def test_run_post_change_validation_accepts_new_passed_result(
 
     assert (
         change_applier.run_post_change_validation(
-            "old-run-id"
+            "old-run-id",
+            ["rollback_target.txt"],
         )
         is True
     )
@@ -518,7 +531,8 @@ def test_run_post_change_validation_rejects_failed_result(
 
     assert (
         change_applier.run_post_change_validation(
-            "old-run-id"
+            "old-run-id",
+            ["rollback_target.txt"],
         )
         is False
     )
@@ -545,7 +559,15 @@ def test_run_post_change_validation_rejects_stale_run_id(
         json.dumps(
             {
                 "run_id": "old-run-id",
-                "status": "PASSED",
+                "status": "FAILED",
+                "command": ["python", "-c", "pass"],
+                "failures": [
+                    {
+                        "file": "rollback_target.txt",
+                        "line": 1,
+                        "test": "test_original_failure",
+                    }
+                ],
             }
         )
         + "\n",
@@ -578,6 +600,8 @@ def test_run_post_change_validation_rejects_stale_run_id(
         lambda: {
             "run_id": "old-run-id",
             "status": "PASSED",
+            "command": ["python", "-c", "pass"],
+            "failures": [],
         },
     )
 
@@ -600,7 +624,8 @@ def test_run_post_change_validation_rejects_stale_run_id(
 
     assert (
         change_applier.run_post_change_validation(
-            "old-run-id"
+            "old-run-id",
+            ["rollback_target.txt"],
         )
         is False
     )
@@ -627,7 +652,15 @@ def test_run_post_change_validation_rejects_no_new_result(
         json.dumps(
             {
                 "run_id": "old-run-id",
-                "status": "PASSED",
+                "status": "FAILED",
+                "command": ["python", "-c", "pass"],
+                "failures": [
+                    {
+                        "file": "rollback_target.txt",
+                        "line": 1,
+                        "test": "test_original_failure",
+                    }
+                ],
             }
         )
         + "\n",
@@ -660,6 +693,8 @@ def test_run_post_change_validation_rejects_no_new_result(
         lambda: {
             "run_id": "old-run-id",
             "status": "PASSED",
+            "command": ["python", "-c", "pass"],
+            "failures": [],
         },
     )
 
@@ -682,7 +717,8 @@ def test_run_post_change_validation_rejects_no_new_result(
 
     assert (
         change_applier.run_post_change_validation(
-            "old-run-id"
+            "old-run-id",
+            ["rollback_target.txt"],
         )
         is False
     )
@@ -843,11 +879,11 @@ def test_apply_change_uses_real_validation_and_keeps_change(
         project_dir,
     )
 
+    assert change_applier.can_apply_change(diagnosis, permission) is True
     success = change_applier.apply_change(diagnosis)
 
     assert success is True
     assert target_path.read_text(encoding="utf-8") == "changed value\n"
-    assert change_applier.can_apply_change(diagnosis, permission) is True
 
 
 def test_apply_change_rolls_back_when_real_validation_fails(
@@ -903,3 +939,76 @@ def test_apply_change_rolls_back_when_real_validation_fails(
 
     assert success is False
     assert target_path.read_text(encoding="utf-8") == original_content
+
+
+def test_apply_change_rolls_back_when_real_validation_is_inconclusive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    target_path = project_dir / "rollback_target.txt"
+    original_content = "original value\n"
+    target_path.write_text(original_content, encoding="utf-8")
+
+    diagnosis: change_applier.DiagnosisRecord = {
+        "run_id": "diagnosis-run-id",
+        "timestamp": "diagnosis-time",
+        "test_timestamp": "test-time",
+        "test_status": "FAILED",
+        "diagnosis": {
+            "status": "FAILED",
+            "diagnosis": "Integration diagnosis",
+            "likely_cause": "Integration cause",
+            "file": "rollback_target.txt",
+            "line": 1,
+            "confidence": "HIGH",
+            "evidence": [],
+            "next_step": "Apply the change",
+            "proposed_change": "Use new content",
+            "affected_files": ["rollback_target.txt"],
+            "change_size": "SMALL",
+            "exact_change": {
+                "file": "rollback_target.txt",
+                "line": 1,
+                "old_text": original_content,
+                "new_text": "changed value\n",
+            },
+        },
+    }
+    permission: change_applier.PermissionRecord = {
+        "run_id": "diagnosis-run-id",
+        "diagnosis_timestamp": "diagnosis-time",
+        "permission_timestamp": "permission-time",
+        "decision": "APPROVED",
+        "file": "rollback_target.txt",
+        "line": 1,
+        "proposed_change": "Use new content",
+        "affected_files": ["rollback_target.txt"],
+        "change_size": "SMALL",
+        "exact_change": {
+            "file": "rollback_target.txt",
+            "line": 1,
+            "old_text": original_content,
+            "new_text": "changed value\n",
+        },
+    }
+
+    _prepare_real_tester_environment(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        exit_code=0,
+        previous_run_id="diagnosis-run-id",
+        previous_failure_file="unrelated_test.py",
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "PROJECT_FOLDER",
+        project_dir,
+    )
+
+    assert change_applier.can_apply_change(diagnosis, permission) is True
+    assert change_applier.apply_change(diagnosis) is False
+    assert target_path.read_text(encoding="utf-8") == original_content
+    assert "Change-aware validation status: INCONCLUSIVE" in capsys.readouterr().out

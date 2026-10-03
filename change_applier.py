@@ -7,6 +7,12 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 from runtime_monitor import COMMAND_TIMEOUT_SECONDS
+from validation_analyzer import (
+    TestResult,
+    ValidationComparison,
+    compare_test_results,
+    parse_test_result,
+)
 
 
 PROJECT_FOLDER = Path(__file__).resolve().parent
@@ -710,9 +716,58 @@ def get_latest_test_result() -> dict[object, object] | None:
     return latest
 
 
+def load_test_results() -> list[TestResult]:
+    if not TEST_RESULTS_FILE.exists():
+        return []
+
+    results: list[TestResult] = []
+
+    try:
+        with TEST_RESULTS_FILE.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            for line in file:
+                stripped_line = line.strip()
+
+                if not stripped_line:
+                    continue
+
+                try:
+                    value: object = json.loads(stripped_line)
+                except json.JSONDecodeError:
+                    continue
+
+                result = parse_test_result(value)
+
+                if result is not None:
+                    results.append(result)
+    except OSError as error:
+        print()
+        print("Test results could not be read.")
+        print(f"Result log error: {error}")
+
+    return results
+
+
 def run_post_change_validation(
     expected_previous_run_id: str,
+    affected_files: list[str] | None = None,
 ) -> bool:
+    previous_results = load_test_results()
+    previous_result = next(
+        (
+            test_result
+            for test_result in previous_results
+            if test_result["run_id"] == expected_previous_run_id
+        ),
+        None,
+    )
+    existing_run_ids = {
+        test_result["run_id"]
+        for test_result in previous_results
+    }
+
     if not TESTER_FILE.exists():
         print()
         print(
@@ -775,52 +830,59 @@ def run_post_change_validation(
         )
         return False
 
-    current_run_id = current_result.get(
-        "run_id"
-    )
-    current_status = current_result.get(
-        "status"
-    )
+    post_change_result = parse_test_result(current_result)
 
-    if not isinstance(current_run_id, str):
+    if post_change_result is None:
         print()
         print(
             "Post-change validation could not be confirmed."
         )
-        print(
-            "The new test result has no run ID."
-        )
+        print("The latest test result is missing required data.")
         return False
 
-    if not current_run_id:
+    if post_change_result["run_id"] == expected_previous_run_id:
         print()
         print(
             "Post-change validation could not be confirmed."
         )
-        print(
-            "The new test result has an empty run ID."
-        )
+        print("The test run ID did not change.")
         return False
 
-    if current_run_id == expected_previous_run_id:
+    if post_change_result["run_id"] in existing_run_ids:
         print()
         print(
             "Post-change validation could not be confirmed."
         )
-        print(
-            "The test run ID did not change."
-        )
+        print("The latest result was already present before validation.")
         return False
 
-    if current_status != "PASSED":
+    if post_change_result["status"] != "PASSED":
         print()
         print(
             "Post-change validation failed."
         )
         print(
             f"Latest test status: "
-            f"{current_status or 'UNKNOWN'}"
+            f"{post_change_result['status']}"
         )
+        return False
+
+    comparison: ValidationComparison = compare_test_results(
+        previous_result,
+        post_change_result,
+        affected_files or [],
+    )
+
+    print()
+    print(
+        "Change-aware validation status: "
+        f"{comparison['validation_status']}"
+    )
+
+    for evidence_item in comparison["evidence"]:
+        print(f"- {evidence_item}")
+
+    if comparison["validation_status"] != "PASSED":
         return False
 
     return True
@@ -851,7 +913,8 @@ def apply_change(
 
     validation_passed = (
         run_post_change_validation(
-            diagnosis["run_id"]
+            diagnosis["run_id"],
+            diagnosis["diagnosis"]["affected_files"],
         )
     )
 
