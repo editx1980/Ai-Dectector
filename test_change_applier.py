@@ -11,8 +11,27 @@ PROJECT_FOLDER = Path(__file__).resolve().parent
 TEST_FILE = PROJECT_FOLDER / "rollback_target.txt"
 
 
+def make_approved_permission(
+    diagnosis: change_applier.DiagnosisRecord,
+) -> change_applier.PermissionRecord:
+    diagnosis_data = diagnosis["diagnosis"]
+    return {
+        "run_id": diagnosis["run_id"],
+        "diagnosis_timestamp": diagnosis["timestamp"],
+        "permission_timestamp": "test-permission-time",
+        "decision": "APPROVED",
+        "file": diagnosis_data["file"],
+        "line": diagnosis_data["line"],
+        "proposed_change": diagnosis_data["proposed_change"],
+        "affected_files": diagnosis_data["affected_files"],
+        "change_size": diagnosis_data["change_size"],
+        "exact_change": diagnosis_data["exact_change"],
+    }
+
+
 def test_apply_change_rolls_back_when_validation_fails(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     original_content = "original value\n"
     new_content = "changed value\n"
@@ -52,19 +71,30 @@ def test_apply_change_rolls_back_when_validation_fails(
 
     def failed_validation(
         _run_id: str,
-        _affected_files: list[str] | None = None,
-    ) -> bool:
-        return False
+        _affected_files: list[str],
+    ) -> change_applier.PostChangeValidationResult:
+        return {
+            "previous_run_id": _run_id,
+            "post_change_run_id": "new-run-id",
+            "change_aware_validation_status": "FAILED",
+            "validation_evidence": ["Simulated failed validation."],
+        }
 
     monkeypatch.setattr(
         change_applier,
-        "run_post_change_validation",
+        "analyze_post_change_validation",
         failed_validation,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "VALIDATION_RESULTS_FILE",
+        tmp_path / "logs" / "validation_results.jsonl",
     )
 
     try:
         success = change_applier.apply_change(
-            diagnosis
+            diagnosis,
+            make_approved_permission(diagnosis),
         )
 
         assert success is False
@@ -319,6 +349,7 @@ def test_missing_run_id_is_rejected_when_parsing_records() -> None:
 
 def test_approved_permission_allows_change_after_validation(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     original_content = "original value\n"
     new_content = "changed value\n"
@@ -378,14 +409,24 @@ def test_approved_permission_allows_change_after_validation(
 
     def successful_validation(
         _run_id: str,
-        _affected_files: list[str] | None = None,
-    ) -> bool:
-        return True
+        _affected_files: list[str],
+    ) -> change_applier.PostChangeValidationResult:
+        return {
+            "previous_run_id": _run_id,
+            "post_change_run_id": "new-run-id",
+            "change_aware_validation_status": "PASSED",
+            "validation_evidence": ["Validation passed."],
+        }
 
     monkeypatch.setattr(
         change_applier,
-        "run_post_change_validation",
+        "analyze_post_change_validation",
         successful_validation,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "VALIDATION_RESULTS_FILE",
+        tmp_path / "logs" / "validation_results.jsonl",
     )
 
     try:
@@ -398,7 +439,8 @@ def test_approved_permission_allows_change_after_validation(
         )
 
         success = change_applier.apply_change(
-            diagnosis
+            diagnosis,
+            permission,
         )
 
         assert success is True
@@ -495,6 +537,11 @@ def _prepare_real_tester_environment(
         change_applier,
         "TEST_RESULTS_FILE",
         test_result_path,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "VALIDATION_RESULTS_FILE",
+        logs_dir / "validation_results.jsonl",
     )
 
 
@@ -880,10 +927,155 @@ def test_apply_change_uses_real_validation_and_keeps_change(
     )
 
     assert change_applier.can_apply_change(diagnosis, permission) is True
-    success = change_applier.apply_change(diagnosis)
+    success = change_applier.apply_change(diagnosis, permission)
 
     assert success is True
     assert target_path.read_text(encoding="utf-8") == "changed value\n"
+    validation_record = json.loads(
+        (project_dir / "logs" / "validation_results.jsonl").read_text(
+            encoding="utf-8",
+        ).strip()
+    )
+    latest_test_result = json.loads(
+        (project_dir / "logs" / "test_results.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[-1]
+    )
+    assert validation_record["previous_run_id"] == "diagnosis-run-id"
+    assert validation_record["post_change_run_id"] == latest_test_result["run_id"]
+    assert validation_record["post_change_run_id"] != "diagnosis-run-id"
+    assert validation_record["change_aware_validation_status"] == "PASSED"
+    assert validation_record["scope_validation_status"] == "PASSED"
+    assert validation_record["final_validation_status"] == "PASSED"
+
+
+@pytest.mark.parametrize(
+    ("approved_files", "expected_scope_status"),
+    [
+        (["../outside.py"], "FAILED"),
+        (
+            ["rollback_target.txt", "not_modified.py"],
+            "INCONCLUSIVE",
+        ),
+    ],
+)
+def test_scope_validation_failure_or_inconclusive_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    approved_files: list[str],
+    expected_scope_status: change_applier.ScopeStatus,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    target_path = project_dir / "rollback_target.txt"
+    original_content = "original value\n"
+    target_path.write_text(original_content, encoding="utf-8")
+
+    diagnosis: change_applier.DiagnosisRecord = {
+        "run_id": "diagnosis-run-id",
+        "timestamp": "diagnosis-time",
+        "test_timestamp": "test-time",
+        "test_status": "FAILED",
+        "diagnosis": {
+            "status": "FAILED",
+            "diagnosis": "Integration diagnosis",
+            "likely_cause": "Integration cause",
+            "file": "rollback_target.txt",
+            "line": 1,
+            "confidence": "HIGH",
+            "evidence": [],
+            "next_step": "Apply the change",
+            "proposed_change": "Use new content",
+            "affected_files": approved_files,
+            "change_size": "SMALL",
+            "exact_change": {
+                "file": "rollback_target.txt",
+                "line": 1,
+                "old_text": original_content,
+                "new_text": "changed value\n",
+            },
+        },
+    }
+
+    _prepare_real_tester_environment(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        exit_code=0,
+        previous_run_id="diagnosis-run-id",
+        previous_failure_file=approved_files[0],
+    )
+
+    assert change_applier.apply_change(
+        diagnosis,
+        make_approved_permission(diagnosis),
+    ) is False
+    assert target_path.read_text(encoding="utf-8") == original_content
+
+    validation_record = json.loads(
+        (project_dir / "logs" / "validation_results.jsonl").read_text(
+            encoding="utf-8",
+        ).strip()
+    )
+    assert validation_record["change_aware_validation_status"] == "PASSED"
+    assert validation_record["scope_validation_status"] == expected_scope_status
+    assert validation_record["final_validation_status"] == expected_scope_status
+
+
+def test_apply_change_rolls_back_when_validation_record_cannot_be_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    target_path = project_dir / "rollback_target.txt"
+    original_content = "original value\n"
+    target_path.write_text(original_content, encoding="utf-8")
+
+    diagnosis: change_applier.DiagnosisRecord = {
+        "run_id": "diagnosis-run-id",
+        "timestamp": "diagnosis-time",
+        "test_timestamp": "test-time",
+        "test_status": "FAILED",
+        "diagnosis": {
+            "status": "FAILED",
+            "diagnosis": "Integration diagnosis",
+            "likely_cause": "Integration cause",
+            "file": "rollback_target.txt",
+            "line": 1,
+            "confidence": "HIGH",
+            "evidence": [],
+            "next_step": "Apply the change",
+            "proposed_change": "Use new content",
+            "affected_files": ["rollback_target.txt"],
+            "change_size": "SMALL",
+            "exact_change": {
+                "file": "rollback_target.txt",
+                "line": 1,
+                "old_text": original_content,
+                "new_text": "changed value\n",
+            },
+        },
+    }
+
+    _prepare_real_tester_environment(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        exit_code=0,
+        previous_run_id="diagnosis-run-id",
+    )
+    invalid_parent = tmp_path / "not-a-directory"
+    invalid_parent.write_text("file blocks log directory", encoding="utf-8")
+    monkeypatch.setattr(
+        change_applier,
+        "VALIDATION_RESULTS_FILE",
+        invalid_parent / "validation_results.jsonl",
+    )
+
+    assert change_applier.apply_change(
+        diagnosis,
+        make_approved_permission(diagnosis),
+    ) is False
+    assert target_path.read_text(encoding="utf-8") == original_content
 
 
 def test_apply_change_rolls_back_when_real_validation_fails(
@@ -935,7 +1127,10 @@ def test_apply_change_rolls_back_when_real_validation_fails(
         project_dir,
     )
 
-    success = change_applier.apply_change(diagnosis)
+    success = change_applier.apply_change(
+        diagnosis,
+        make_approved_permission(diagnosis),
+    )
 
     assert success is False
     assert target_path.read_text(encoding="utf-8") == original_content
@@ -1009,6 +1204,9 @@ def test_apply_change_rolls_back_when_real_validation_is_inconclusive(
     )
 
     assert change_applier.can_apply_change(diagnosis, permission) is True
-    assert change_applier.apply_change(diagnosis) is False
+    assert change_applier.apply_change(
+        diagnosis,
+        make_approved_permission(diagnosis),
+    ) is False
     assert target_path.read_text(encoding="utf-8") == original_content
     assert "Change-aware validation status: INCONCLUSIVE" in capsys.readouterr().out

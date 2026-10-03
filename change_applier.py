@@ -3,12 +3,20 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 from runtime_monitor import COMMAND_TIMEOUT_SECONDS
+from scope_analyzer import (
+    ScopeStatus,
+    ScopeValidationResult,
+    compare_scopes,
+)
 from validation_analyzer import (
     TestResult,
+    ValidationStatus,
     ValidationComparison,
     compare_test_results,
     parse_test_result,
@@ -21,6 +29,7 @@ LOG_FOLDER = PROJECT_FOLDER / "logs"
 DIAGNOSES_FILE = LOG_FOLDER / "diagnoses.jsonl"
 PERMISSIONS_FILE = LOG_FOLDER / "permissions.jsonl"
 TEST_RESULTS_FILE = LOG_FOLDER / "test_results.jsonl"
+VALIDATION_RESULTS_FILE = LOG_FOLDER / "validation_results.jsonl"
 TESTER_FILE = PROJECT_FOLDER / "tester.py"
 
 
@@ -71,6 +80,32 @@ class PermissionRecord(TypedDict):
     affected_files: list[str]
     change_size: str
     exact_change: ExactChange
+
+
+class PostChangeValidationResult(TypedDict):
+    previous_run_id: str
+    post_change_run_id: str | None
+    change_aware_validation_status: ValidationStatus
+    validation_evidence: list[str]
+
+
+class UnifiedValidationRecord(TypedDict):
+    transaction_id: str
+    diagnosis_timestamp: str
+    permission_timestamp: str
+    timestamp: str
+    previous_run_id: str
+    post_change_run_id: str | None
+    change_file: str
+    expected_files: list[str]
+    actual_files: list[str] | None
+    unexpected_files: list[str]
+    missing_expected_files: list[str]
+    change_aware_validation_status: ValidationStatus
+    scope_validation_status: ScopeStatus
+    final_validation_status: ValidationStatus
+    scope_evidence: list[str]
+    validation_evidence: list[str]
 
 
 def load_latest_diagnosis() -> DiagnosisRecord | None:
@@ -750,10 +785,10 @@ def load_test_results() -> list[TestResult]:
     return results
 
 
-def run_post_change_validation(
+def analyze_post_change_validation(
     expected_previous_run_id: str,
-    affected_files: list[str] | None = None,
-) -> bool:
+    affected_files: list[str],
+) -> PostChangeValidationResult:
     previous_results = load_test_results()
     previous_result = next(
         (
@@ -776,7 +811,14 @@ def run_post_change_validation(
         print(
             "tester.py was not found."
         )
-        return False
+        return {
+            "previous_run_id": expected_previous_run_id,
+            "post_change_run_id": None,
+            "change_aware_validation_status": "FAILED",
+            "validation_evidence": [
+                "tester.py was not found."
+            ],
+        }
 
     try:
         result = subprocess.run(
@@ -796,7 +838,14 @@ def run_post_change_validation(
         print(
             "tester.py exceeded the configured timeout."
         )
-        return False
+        return {
+            "previous_run_id": expected_previous_run_id,
+            "post_change_run_id": None,
+            "change_aware_validation_status": "FAILED",
+            "validation_evidence": [
+                "tester.py exceeded the configured timeout."
+            ],
+        }
     except OSError as error:
         print()
         print(
@@ -805,7 +854,14 @@ def run_post_change_validation(
         print(
             f"Validation error: {error}"
         )
-        return False
+        return {
+            "previous_run_id": expected_previous_run_id,
+            "post_change_run_id": None,
+            "change_aware_validation_status": "FAILED",
+            "validation_evidence": [
+                f"Could not execute tester.py: {error}"
+            ],
+        }
 
     if result.returncode != 0:
         print()
@@ -816,9 +872,31 @@ def run_post_change_validation(
             f"tester.py exited with code "
             f"{result.returncode}."
         )
-        return False
+        return {
+            "previous_run_id": expected_previous_run_id,
+            "post_change_run_id": None,
+            "change_aware_validation_status": "FAILED",
+            "validation_evidence": [
+                f"tester.py exited with code {result.returncode}."
+            ],
+        }
 
-    current_result = get_latest_test_result()
+    try:
+        current_result = get_latest_test_result()
+    except OSError as error:
+        print()
+        print(
+            "Post-change validation could not be confirmed."
+        )
+        print(f"Test result log could not be read: {error}")
+        return {
+            "previous_run_id": expected_previous_run_id,
+            "post_change_run_id": None,
+            "change_aware_validation_status": "INCONCLUSIVE",
+            "validation_evidence": [
+                f"Test result log could not be read: {error}"
+            ],
+        }
 
     if current_result is None:
         print()
@@ -828,7 +906,14 @@ def run_post_change_validation(
         print(
             "No test result was recorded."
         )
-        return False
+        return {
+            "previous_run_id": expected_previous_run_id,
+            "post_change_run_id": None,
+            "change_aware_validation_status": "INCONCLUSIVE",
+            "validation_evidence": [
+                "No post-change test result was recorded."
+            ],
+        }
 
     post_change_result = parse_test_result(current_result)
 
@@ -838,7 +923,14 @@ def run_post_change_validation(
             "Post-change validation could not be confirmed."
         )
         print("The latest test result is missing required data.")
-        return False
+        return {
+            "previous_run_id": expected_previous_run_id,
+            "post_change_run_id": None,
+            "change_aware_validation_status": "INCONCLUSIVE",
+            "validation_evidence": [
+                "The latest test result is missing required data."
+            ],
+        }
 
     if post_change_result["run_id"] == expected_previous_run_id:
         print()
@@ -846,7 +938,14 @@ def run_post_change_validation(
             "Post-change validation could not be confirmed."
         )
         print("The test run ID did not change.")
-        return False
+        return {
+            "previous_run_id": expected_previous_run_id,
+            "post_change_run_id": post_change_result["run_id"],
+            "change_aware_validation_status": "FAILED",
+            "validation_evidence": [
+                "The test run ID did not change."
+            ],
+        }
 
     if post_change_result["run_id"] in existing_run_ids:
         print()
@@ -854,23 +953,19 @@ def run_post_change_validation(
             "Post-change validation could not be confirmed."
         )
         print("The latest result was already present before validation.")
-        return False
-
-    if post_change_result["status"] != "PASSED":
-        print()
-        print(
-            "Post-change validation failed."
-        )
-        print(
-            f"Latest test status: "
-            f"{post_change_result['status']}"
-        )
-        return False
+        return {
+            "previous_run_id": expected_previous_run_id,
+            "post_change_run_id": post_change_result["run_id"],
+            "change_aware_validation_status": "FAILED",
+            "validation_evidence": [
+                "The latest result was already present before validation."
+            ],
+        }
 
     comparison: ValidationComparison = compare_test_results(
         previous_result,
         post_change_result,
-        affected_files or [],
+        affected_files,
     )
 
     print()
@@ -882,7 +977,70 @@ def run_post_change_validation(
     for evidence_item in comparison["evidence"]:
         print(f"- {evidence_item}")
 
-    if comparison["validation_status"] != "PASSED":
+    return {
+        "previous_run_id": expected_previous_run_id,
+        "post_change_run_id": post_change_result["run_id"],
+        "change_aware_validation_status": comparison[
+            "validation_status"
+        ],
+        "validation_evidence": comparison["evidence"],
+    }
+
+
+def run_post_change_validation(
+    expected_previous_run_id: str,
+    affected_files: list[str] | None = None,
+) -> bool:
+    result = analyze_post_change_validation(
+        expected_previous_run_id,
+        affected_files or [],
+    )
+
+    return result["change_aware_validation_status"] == "PASSED"
+
+
+def combine_validation_statuses(
+    change_aware_status: ValidationStatus,
+    scope_status: ScopeStatus,
+) -> ValidationStatus:
+    if (
+        change_aware_status == "FAILED"
+        or scope_status == "FAILED"
+    ):
+        return "FAILED"
+
+    if (
+        change_aware_status == "INCONCLUSIVE"
+        or scope_status == "INCONCLUSIVE"
+    ):
+        return "INCONCLUSIVE"
+
+    return "PASSED"
+
+
+def write_validation_result(
+    record: UnifiedValidationRecord,
+) -> bool:
+    try:
+        VALIDATION_RESULTS_FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        with VALIDATION_RESULTS_FILE.open(
+            "a",
+            encoding="utf-8",
+        ) as file:
+            file.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except OSError as error:
+        print()
+        print("Validation result could not be persisted.")
+        print(f"Validation log error: {error}")
         return False
 
     return True
@@ -890,7 +1048,19 @@ def run_post_change_validation(
 
 def apply_change(
     diagnosis: DiagnosisRecord,
+    permission: PermissionRecord,
 ) -> bool:
+    if not can_apply_change(
+        diagnosis,
+        permission,
+    ):
+        print("No matching approved permission found.")
+        print("No files have been modified.")
+        return False
+
+    transaction_id = str(uuid.uuid4())
+    expected_files = permission["affected_files"]
+
     applied, target, original_content = (
         apply_exact_change(
             diagnosis
@@ -911,26 +1081,71 @@ def apply_change(
         )
         return False
 
-    validation_passed = (
-        run_post_change_validation(
-            diagnosis["run_id"],
-            diagnosis["diagnosis"]["affected_files"],
-        )
+    actual_files = [str(target)]
+    post_change_validation = analyze_post_change_validation(
+        diagnosis["run_id"],
+        expected_files,
+    )
+    scope_validation: ScopeValidationResult = compare_scopes(
+        expected_files,
+        actual_files,
+        PROJECT_FOLDER,
+    )
+    final_status = combine_validation_statuses(
+        post_change_validation["change_aware_validation_status"],
+        scope_validation["scope_status"],
     )
 
     print()
+    print(
+        f"Scope validation status: "
+        f"{scope_validation['scope_status']}"
+    )
+    for evidence_item in scope_validation["evidence"]:
+        print(f"- {evidence_item}")
+    print(f"Final validation status: {final_status}")
 
-    if validation_passed:
+    validation_record: UnifiedValidationRecord = {
+        "transaction_id": transaction_id,
+        "diagnosis_timestamp": diagnosis["timestamp"],
+        "permission_timestamp": permission["permission_timestamp"],
+        "timestamp": datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        ),
+        "previous_run_id": diagnosis["run_id"],
+        "post_change_run_id": post_change_validation[
+            "post_change_run_id"
+        ],
+        "change_file": str(target),
+        "expected_files": scope_validation["expected_files"],
+        "actual_files": scope_validation["actual_files"],
+        "unexpected_files": scope_validation["unexpected_files"],
+        "missing_expected_files": scope_validation[
+            "missing_expected_files"
+        ],
+        "change_aware_validation_status": post_change_validation[
+            "change_aware_validation_status"
+        ],
+        "scope_validation_status": scope_validation["scope_status"],
+        "final_validation_status": final_status,
+        "scope_evidence": scope_validation["evidence"],
+        "validation_evidence": post_change_validation[
+            "validation_evidence"
+        ],
+    }
+
+    if not write_validation_result(validation_record):
+        final_status = "FAILED"
+
+    if final_status == "PASSED":
         print(
             "Change successful."
         )
-        print(
-            "Post-change validation passed."
-        )
+        print("All required validation stages passed.")
         return True
 
     print(
-        "Post-change validation did not pass."
+        f"Change was not accepted: validation status is {final_status}."
     )
     print(
         "Restoring the original file..."
@@ -989,7 +1204,8 @@ def main() -> None:
         return
 
     apply_change(
-        diagnosis
+        diagnosis,
+        permission,
     )
 
 
