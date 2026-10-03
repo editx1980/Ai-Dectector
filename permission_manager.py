@@ -12,6 +12,12 @@ from change_transaction import (
     get_transaction,
     transition_transaction,
 )
+from change_risk_analyzer import (
+    ChangeRiskAssessment,
+    DiagnosisEvidence,
+    analyze_change_risk,
+)
+from validation_analyzer import TestResult, parse_test_result
 
 
 PROJECT_FOLDER = Path(__file__).resolve().parent
@@ -20,6 +26,7 @@ LOG_FOLDER = PROJECT_FOLDER / "logs"
 DIAGNOSES_FILE = LOG_FOLDER / "diagnoses.jsonl"
 PERMISSIONS_FILE = LOG_FOLDER / "permissions.jsonl"
 CHANGE_TRANSACTIONS_FILE = LOG_FOLDER / "change_transactions.jsonl"
+TEST_RESULTS_FILE = LOG_FOLDER / "test_results.jsonl"
 
 
 ChangeSize = Literal[
@@ -79,6 +86,52 @@ class PermissionRecord(TypedDict):
     change_size: ChangeSize
     exact_change: ExactChange
     transaction_id: NotRequired[str | None]
+    risk_assessment: NotRequired[ChangeRiskAssessment]
+
+
+def load_originating_test_result(
+    run_id: str,
+) -> tuple[TestResult | None, str | None]:
+    if not TEST_RESULTS_FILE.exists():
+        return None, "The test-results log does not exist."
+
+    matching_results: list[TestResult] = []
+    try:
+        with TEST_RESULTS_FILE.open("r", encoding="utf-8") as file:
+            for line_number, line in enumerate(file, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    raw: object = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                raw_record = cast(dict[object, object], raw)
+                if raw_record.get("run_id") != run_id:
+                    continue
+                result = parse_test_result(raw)
+                if result is None:
+                    return (
+                        None,
+                        f"Test-result record for run_id={run_id} on line "
+                        f"{line_number} is invalid.",
+                    )
+                matching_results.append(result)
+    except OSError as error:
+        return None, f"Could not read test-results log: {error}"
+
+    if not matching_results:
+        return None, f"No test result was found for run_id={run_id}."
+
+    first_result = matching_results[0]
+    if any(result != first_result for result in matching_results[1:]):
+        return (
+            None,
+            f"Conflicting test-result records were found for run_id={run_id}.",
+        )
+
+    return first_result, None
 
 
 def load_latest_diagnosis() -> DiagnosisRecord | None:
@@ -454,6 +507,7 @@ def save_permission(
     diagnosis: DiagnosisRecord,
     decision: Decision,
     transaction_id: str | None = None,
+    risk_assessment: ChangeRiskAssessment | None = None,
 ) -> PermissionRecord:
     diagnosis_data = diagnosis[
         "diagnosis"
@@ -495,6 +549,12 @@ def save_permission(
     }
     if transaction_id is not None:
         record["transaction_id"] = transaction_id
+    if risk_assessment is not None:
+        if risk_assessment["originating_run_id"] != diagnosis["run_id"]:
+            raise TransactionLogError(
+                "Risk assessment run ID does not match the diagnosis run ID."
+            )
+        record["risk_assessment"] = risk_assessment
 
     LOG_FOLDER.mkdir(
         parents=True,
@@ -518,6 +578,8 @@ def save_permission(
 
 def print_change_request(
     diagnosis: DiagnosisRecord,
+    risk_assessment: ChangeRiskAssessment | None = None,
+    transaction_id: str | None = None,
 ) -> None:
     diagnosis_data = diagnosis[
         "diagnosis"
@@ -533,6 +595,10 @@ def print_change_request(
     print("=" * 50)
 
     print()
+    print(f"Transaction ID: {transaction_id or 'Unavailable (legacy record)'}")
+    print(f"Originating run ID: {diagnosis['run_id']}")
+
+    print()
 
     print("Diagnosis:")
     print(
@@ -540,6 +606,15 @@ def print_change_request(
             "diagnosis"
         ]
     )
+    print("Likely cause:")
+    print(diagnosis_data["likely_cause"])
+    print(f"Diagnosis confidence: {diagnosis_data['confidence']}")
+    print("Diagnosis-provided evidence:")
+    if diagnosis_data["evidence"]:
+        for evidence_item in diagnosis_data["evidence"]:
+            print(f"  - {evidence_item}")
+    else:
+        print("  - None provided")
 
     print()
 
@@ -587,6 +662,7 @@ def print_change_request(
     print()
 
     print("Affected files:")
+    print("(Diagnosis-provided proposed scope; not actual changed files.)")
 
     affected_files = diagnosis_data[
         "affected_files"
@@ -611,6 +687,66 @@ def print_change_request(
         ]
     )
 
+    print()
+    print("Risk assessment (advisory only):")
+    if risk_assessment is None:
+        print("Risk: UNKNOWN")
+        print("Risk analysis is unavailable.")
+    else:
+        print(f"Risk: {risk_assessment['level']}")
+        print("Reasons:")
+        for reason in risk_assessment["reasons"]:
+            print(f"  - {reason}")
+        if not risk_assessment["reasons"]:
+            print("  - No risk reasons were recorded.")
+
+        print("Uncertainty:")
+        if risk_assessment["uncertainties"]:
+            for uncertainty in risk_assessment["uncertainties"]:
+                print(f"  - {uncertainty}")
+        else:
+            print("  - No uncertainty recorded.")
+
+        print("Originating test context:")
+        if risk_assessment["test_status"] is None:
+            print("  Status: Unknown")
+        else:
+            print(
+                f"  Status: {risk_assessment['test_status']} "
+                f"(run_id={risk_assessment['originating_run_id']})"
+            )
+        command = risk_assessment["test_command"]
+        print(
+            "  Command: "
+            + (" ".join(command) if command is not None else "Unknown")
+        )
+        if risk_assessment["test_result_issue"] is not None:
+            print(
+                "  Test evidence issue: "
+                f"{risk_assessment['test_result_issue']}"
+            )
+        if risk_assessment["relevant_test_failures"]:
+            print("  Recorded failures in proposed scope:")
+            for failure in risk_assessment["relevant_test_failures"]:
+                test_name = failure.get("test", "Unknown test")
+                print(
+                    f"    - {failure['file']}:{failure['line']} "
+                    f"({test_name})"
+                )
+        else:
+            print("  Matching failure records: None verified")
+
+    print()
+    print("Exact edit being approved:")
+    print(
+        f"  {exact_change['file'] or 'Unknown'}:"
+        f"{exact_change['line'] or 'Unknown'}"
+    )
+    print(f"  Replace: {exact_change['old_text'] or 'Unknown'}")
+    print(f"  With:    {exact_change['new_text'] or 'Unknown'}")
+    print()
+    print("Risk does not approve or reject this change.")
+    print("Explicit user permission is still required.")
     print()
     print("=" * 50)
 
@@ -667,6 +803,29 @@ def main(transaction_id: str | None = None) -> int:
             print("Transaction ID does not match this diagnosis lifecycle.")
             return 1
 
+    test_result, test_result_issue = load_originating_test_result(
+        diagnosis["run_id"]
+    )
+    diagnosis_data = diagnosis["diagnosis"]
+    risk_diagnosis: DiagnosisEvidence = {
+        "confidence": diagnosis_data["confidence"],
+        "diagnosis": diagnosis_data["diagnosis"],
+        "likely_cause": diagnosis_data["likely_cause"],
+        "proposed_change": diagnosis_data["proposed_change"],
+        "change_size": diagnosis_data["change_size"],
+        "affected_files": diagnosis_data["affected_files"],
+        "file": diagnosis_data["file"],
+        "exact_change": diagnosis_data["exact_change"],
+        "evidence": diagnosis_data["evidence"],
+    }
+    risk_assessment = analyze_change_risk(
+        risk_diagnosis,
+        diagnosis["run_id"],
+        test_result,
+        test_result_issue=test_result_issue,
+    )
+
+    if transaction_id is not None:
         try:
             transition_transaction(
                 transaction_id,
@@ -674,6 +833,7 @@ def main(transaction_id: str | None = None) -> int:
                 "AWAITING_PERMISSION",
                 {
                     "diagnosis_timestamp": diagnosis["timestamp"],
+                    "risk_assessment": risk_assessment,
                     "evidence": ["Awaiting the user's permission decision."],
                 },
                 CHANGE_TRANSACTIONS_FILE,
@@ -685,10 +845,6 @@ def main(transaction_id: str | None = None) -> int:
         ) as error:
             print(f"Transaction audit update failed: {error}")
             return 1
-
-    diagnosis_data = diagnosis[
-        "diagnosis"
-    ]
 
     if diagnosis_data[
         "change_size"
@@ -719,7 +875,9 @@ def main(transaction_id: str | None = None) -> int:
         return 0
 
     print_change_request(
-        diagnosis
+        diagnosis,
+        risk_assessment,
+        transaction_id,
     )
 
     decision = ask_permission()
@@ -729,6 +887,7 @@ def main(transaction_id: str | None = None) -> int:
             diagnosis,
             decision,
             transaction_id,
+            risk_assessment,
         )
         if transaction_id is not None:
             new_state = (

@@ -6,6 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
+from change_risk_analyzer import (
+    ChangeRiskAssessment,
+    parse_change_risk_assessment,
+)
+
 
 TransactionState = Literal[
     "PROPOSED",
@@ -51,6 +56,7 @@ class ChangeTransaction(TypedDict):
     diagnosis_timestamp: str | None
     permission_timestamp: str | None
     permission_decision: PermissionDecision | None
+    risk_assessment: ChangeRiskAssessment | None
     affected_files: list[str]
     actual_changed_files: list[str]
     post_change_test_status: TransactionStatus | None
@@ -66,6 +72,7 @@ class TransactionUpdate(TypedDict, total=False):
     diagnosis_timestamp: str | None
     permission_timestamp: str | None
     permission_decision: PermissionDecision | None
+    risk_assessment: ChangeRiskAssessment
     affected_files: list[str]
     actual_changed_files: list[str]
     post_change_run_id: str | None
@@ -147,6 +154,7 @@ def _parse_transaction(value: object, line_number: int) -> ChangeTransaction:
     diagnosis_timestamp = record.get("diagnosis_timestamp")
     permission_timestamp = record.get("permission_timestamp")
     permission_decision = record.get("permission_decision")
+    raw_risk_assessment = record.get("risk_assessment")
     affected_files = record.get("affected_files")
     actual_changed_files = record.get("actual_changed_files")
     post_change_test_status = record.get("post_change_test_status")
@@ -225,6 +233,22 @@ def _parse_transaction(value: object, line_number: int) -> ChangeTransaction:
         raise TransactionLogError(
             f"Transaction log line {line_number} has an invalid permission decision."
         )
+    risk_assessment = (
+        parse_change_risk_assessment(raw_risk_assessment)
+        if raw_risk_assessment is not None
+        else None
+    )
+    if raw_risk_assessment is not None and risk_assessment is None:
+        raise TransactionLogError(
+            f"Transaction log line {line_number} has invalid risk assessment."
+        )
+    if (
+        risk_assessment is not None
+        and risk_assessment["originating_run_id"] != diagnosis_run_id
+    ):
+        raise TransactionLogError(
+            f"Transaction log line {line_number} links risk to another run ID."
+        )
     if not isinstance(affected_files, list) or not all(
         isinstance(path, str) for path in cast(list[object], affected_files)
     ):
@@ -282,6 +306,7 @@ def _parse_transaction(value: object, line_number: int) -> ChangeTransaction:
         "permission_decision": cast(
             PermissionDecision | None, permission_decision
         ),
+        "risk_assessment": risk_assessment,
         "affected_files": cast(list[str], affected_files),
         "actual_changed_files": cast(list[str], actual_changed_files),
         "post_change_test_status": cast(
@@ -371,12 +396,23 @@ def load_latest_transactions(
                 transaction = _parse_transaction(raw, line_number)
                 previous = latest.get(transaction["transaction_id"])
                 if previous is not None:
+                    risk_was_added_at_permission = (
+                        previous["risk_assessment"] is None
+                        and transaction["risk_assessment"] is not None
+                        and previous["state"] == "PROPOSED"
+                        and transaction["state"] == "AWAITING_PERMISSION"
+                    )
+                    risk_changed = (
+                        previous["risk_assessment"]
+                        != transaction["risk_assessment"]
+                    )
                     if (
                         transaction["created_at"] != previous["created_at"]
                         or transaction["diagnosis_run_id"]
                         != previous["diagnosis_run_id"]
                         or transaction["pre_change_run_id"]
                         != previous["pre_change_run_id"]
+                        or (risk_changed and not risk_was_added_at_permission)
                         or transaction["state"]
                         not in _ALLOWED_TRANSITIONS[previous["state"]]
                     ):
@@ -442,6 +478,7 @@ def create_transaction(
         "diagnosis_timestamp": None,
         "permission_timestamp": None,
         "permission_decision": None,
+        "risk_assessment": None,
         "affected_files": [],
         "actual_changed_files": [],
         "post_change_test_status": None,
@@ -493,6 +530,19 @@ def transition_transaction(
         updated["permission_timestamp"] = updates["permission_timestamp"]
     if "permission_decision" in updates:
         updated["permission_decision"] = updates["permission_decision"]
+    if "risk_assessment" in updates:
+        if not (
+            expected_state == "PROPOSED"
+            and new_state == "AWAITING_PERMISSION"
+            and transaction["risk_assessment"] is None
+            and updates["risk_assessment"]["originating_run_id"]
+            == transaction["diagnosis_run_id"]
+        ):
+            raise InvalidTransactionTransition(
+                "Risk assessment may only be recorded once when entering "
+                "AWAITING_PERMISSION for the diagnosis run."
+            )
+        updated["risk_assessment"] = updates["risk_assessment"]
     if "affected_files" in updates:
         updated["affected_files"] = updates["affected_files"]
     if "actual_changed_files" in updates:

@@ -1,8 +1,36 @@
+import json
 from pathlib import Path
 
 import pytest
 
 import change_transaction
+from change_risk_analyzer import ChangeRiskAssessment, analyze_change_risk
+
+
+def make_risk_assessment(
+    run_id: str,
+) -> ChangeRiskAssessment:
+    assessment = analyze_change_risk(
+        {
+            "confidence": "HIGH",
+            "diagnosis": "A test failure was observed.",
+            "likely_cause": "The value is incorrect.",
+            "proposed_change": "Replace the value.",
+            "change_size": "LARGE",
+            "affected_files": ["src/module.py"],
+            "file": "src/module.py",
+            "exact_change": {
+                "file": "src/module.py",
+                "line": 1,
+                "old_text": "old",
+                "new_text": "new",
+            },
+            "evidence": ["Diagnosis evidence."],
+        },
+        run_id,
+        None,
+    )
+    return assessment
 
 
 def create_transaction(
@@ -317,3 +345,101 @@ def test_success_cannot_be_recorded_without_rollback_status(
             },
             log_path,
         )
+
+
+def test_risk_assessment_is_additive_and_does_not_approve_transaction(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "change_transactions.jsonl"
+    transaction = create_transaction(log_path)
+    assessment = make_risk_assessment(transaction["diagnosis_run_id"])
+
+    awaiting = change_transaction.transition_transaction(
+        transaction["transaction_id"],
+        "PROPOSED",
+        "AWAITING_PERMISSION",
+        {
+            "diagnosis_timestamp": "diagnosis-time",
+            "risk_assessment": assessment,
+        },
+        log_path,
+    )
+
+    assert awaiting["state"] == "AWAITING_PERMISSION"
+    assert awaiting["risk_assessment"] == assessment
+    assert awaiting["permission_decision"] is None
+    assert awaiting["post_change_test_status"] is None
+    assert awaiting["change_aware_validation_status"] is None
+    assert awaiting["scope_validation_status"] is None
+    assert awaiting["rollback_succeeded"] is None
+    assert awaiting["final_outcome"] is None
+
+
+def test_risk_assessment_is_immutable_after_permission_stage(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "change_transactions.jsonl"
+    transaction = create_transaction(log_path)
+    assessment = make_risk_assessment(transaction["diagnosis_run_id"])
+    change_transaction.transition_transaction(
+        transaction["transaction_id"],
+        "PROPOSED",
+        "AWAITING_PERMISSION",
+        {"risk_assessment": assessment},
+        log_path,
+    )
+    before = log_path.read_text(encoding="utf-8")
+    replacement = make_risk_assessment(transaction["diagnosis_run_id"])
+    replacement["level"] = "LOW"
+
+    with pytest.raises(change_transaction.InvalidTransactionTransition):
+        change_transaction.transition_transaction(
+            transaction["transaction_id"],
+            "AWAITING_PERMISSION",
+            "APPROVED",
+            {
+                "permission_decision": "APPROVED",
+                "risk_assessment": replacement,
+            },
+            log_path,
+        )
+
+    assert log_path.read_text(encoding="utf-8") == before
+
+
+def test_risk_assessment_must_reference_diagnosis_run_id(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "change_transactions.jsonl"
+    transaction = create_transaction(log_path)
+    assessment = make_risk_assessment("different-run")
+
+    with pytest.raises(change_transaction.InvalidTransactionTransition):
+        change_transaction.transition_transaction(
+            transaction["transaction_id"],
+            "PROPOSED",
+            "AWAITING_PERMISSION",
+            {"risk_assessment": assessment},
+            log_path,
+        )
+
+
+def test_legacy_transaction_without_risk_field_remains_parseable(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "change_transactions.jsonl"
+    transaction = create_transaction(log_path)
+    raw_record = json.loads(log_path.read_text(encoding="utf-8"))
+    raw_record.pop("risk_assessment")
+    log_path.write_text(
+        json.dumps(raw_record) + "\n",
+        encoding="utf-8",
+    )
+
+    loaded = change_transaction.get_transaction(
+        transaction["transaction_id"],
+        log_path,
+    )
+
+    assert loaded is not None
+    assert loaded["risk_assessment"] is None

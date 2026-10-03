@@ -1,3 +1,4 @@
+import builtins
 import json
 from pathlib import Path
 
@@ -6,6 +7,14 @@ import pytest
 import ai_diagnoser
 import change_transaction
 import permission_manager
+
+
+def test_permission_prompt_defaults_to_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(builtins, "input", lambda _prompt: "")
+
+    assert permission_manager.ask_permission() == "REJECTED"
 
 
 def test_diagnosis_persists_explicit_transaction_link(
@@ -68,9 +77,15 @@ def test_permission_approval_and_rejection_persist_transaction_states(
     diagnosis_path = tmp_path / "diagnoses.jsonl"
     permission_path = tmp_path / "permissions.jsonl"
     transaction_path = tmp_path / "change_transactions.jsonl"
+    test_results_path = tmp_path / "test_results.jsonl"
     monkeypatch.setattr(permission_manager, "DIAGNOSES_FILE", diagnosis_path)
     monkeypatch.setattr(permission_manager, "PERMISSIONS_FILE", permission_path)
     monkeypatch.setattr(permission_manager, "LOG_FOLDER", tmp_path)
+    monkeypatch.setattr(
+        permission_manager,
+        "TEST_RESULTS_FILE",
+        test_results_path,
+    )
     monkeypatch.setattr(
         permission_manager,
         "CHANGE_TRANSACTIONS_FILE",
@@ -127,6 +142,11 @@ def test_permission_approval_and_rejection_persist_transaction_states(
         )
         assert permission_record["transaction_id"] == transaction_id
         assert permission_record["decision"] == decision
+        assert permission_record["risk_assessment"]["level"] == "UNKNOWN"
+        assert (
+            permission_record["risk_assessment"]["originating_run_id"]
+            == diagnosis_record["run_id"]
+        )
         current = change_transaction.get_transaction(
             transaction_id,
             transaction_path,
@@ -136,6 +156,9 @@ def test_permission_approval_and_rejection_persist_transaction_states(
         assert current["permission_decision"] == decision
         assert current["permission_timestamp"] == permission_record[
             "permission_timestamp"
+        ]
+        assert current["risk_assessment"] == permission_record[
+            "risk_assessment"
         ]
 
 

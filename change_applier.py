@@ -405,6 +405,7 @@ def parse_permission(
     value: dict[object, object],
 ) -> PermissionRecord | None:
     run_id = value.get("run_id")
+    transaction_id = value.get("transaction_id")
     diagnosis_timestamp = value.get(
         "diagnosis_timestamp"
     )
