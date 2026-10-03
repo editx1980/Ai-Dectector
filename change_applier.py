@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
+from runtime_monitor import COMMAND_TIMEOUT_SECONDS
+
 
 PROJECT_FOLDER = Path(__file__).resolve().parent
 LOG_FOLDER = PROJECT_FOLDER / "logs"
@@ -729,7 +731,17 @@ def run_post_change_validation(
             ],
             cwd=PROJECT_FOLDER,
             check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired:
+        print()
+        print(
+            "Post-change validation failed."
+        )
+        print(
+            "tester.py exceeded the configured timeout."
+        )
+        return False
     except OSError as error:
         print()
         print(
@@ -777,6 +789,16 @@ def run_post_change_validation(
         )
         print(
             "The new test result has no run ID."
+        )
+        return False
+
+    if not current_run_id:
+        print()
+        print(
+            "Post-change validation could not be confirmed."
+        )
+        print(
+            "The new test result has an empty run ID."
         )
         return False
 

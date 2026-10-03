@@ -1,3 +1,5 @@
+import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -408,3 +410,496 @@ def test_approved_permission_allows_change_after_validation(
     finally:
         if TEST_FILE.exists():
             TEST_FILE.unlink()
+
+
+def _prepare_real_tester_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    exit_code: int,
+    previous_run_id: str,
+) -> None:
+    project_dir = tmp_path / "project"
+    logs_dir = project_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    source_folder = Path(__file__).resolve().parent
+
+    for file_name in ("tester.py", "runtime_monitor.py"):
+        source_path = source_folder / file_name
+        destination = project_dir / file_name
+        destination.write_text(
+            source_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+    command_script = (
+        "import sys; "
+        f"sys.exit({exit_code})"
+    )
+
+    config_path = project_dir / "overseer.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "test_command": [
+                    "python",
+                    "-c",
+                    command_script,
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    test_result_path = logs_dir / "test_results.jsonl"
+    test_result_path.write_text(
+        json.dumps(
+            {
+                "run_id": previous_run_id,
+                "status": "PASSED",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        change_applier,
+        "PROJECT_FOLDER",
+        project_dir,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "LOG_FOLDER",
+        logs_dir,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "TESTER_FILE",
+        project_dir / "tester.py",
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "TEST_RESULTS_FILE",
+        test_result_path,
+    )
+
+
+def test_run_post_change_validation_accepts_new_passed_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _prepare_real_tester_environment(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        exit_code=0,
+        previous_run_id="old-run-id",
+    )
+
+    assert (
+        change_applier.run_post_change_validation(
+            "old-run-id"
+        )
+        is True
+    )
+
+
+def test_run_post_change_validation_rejects_failed_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _prepare_real_tester_environment(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        exit_code=1,
+        previous_run_id="old-run-id",
+    )
+
+    assert (
+        change_applier.run_post_change_validation(
+            "old-run-id"
+        )
+        is False
+    )
+
+
+def test_run_post_change_validation_rejects_stale_run_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    logs_dir = project_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    tester_path = project_dir / "tester.py"
+    tester_path.write_text(
+        (Path(__file__).resolve().parent / "tester.py").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+
+    test_result_path = logs_dir / "test_results.jsonl"
+    test_result_path.write_text(
+        json.dumps(
+            {
+                "run_id": "old-run-id",
+                "status": "PASSED",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        change_applier,
+        "PROJECT_FOLDER",
+        project_dir,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "LOG_FOLDER",
+        logs_dir,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "TESTER_FILE",
+        tester_path,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "TEST_RESULTS_FILE",
+        test_result_path,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "get_latest_test_result",
+        lambda: {
+            "run_id": "old-run-id",
+            "status": "PASSED",
+        },
+    )
+
+    def fake_run(
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(
+        change_applier.subprocess,
+        "run",
+        fake_run,
+    )
+
+    assert (
+        change_applier.run_post_change_validation(
+            "old-run-id"
+        )
+        is False
+    )
+
+
+def test_run_post_change_validation_rejects_no_new_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    logs_dir = project_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    tester_path = project_dir / "tester.py"
+    tester_path.write_text(
+        (Path(__file__).resolve().parent / "tester.py").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+
+    test_result_path = logs_dir / "test_results.jsonl"
+    test_result_path.write_text(
+        json.dumps(
+            {
+                "run_id": "old-run-id",
+                "status": "PASSED",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        change_applier,
+        "PROJECT_FOLDER",
+        project_dir,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "LOG_FOLDER",
+        logs_dir,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "TESTER_FILE",
+        tester_path,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "TEST_RESULTS_FILE",
+        test_result_path,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "get_latest_test_result",
+        lambda: {
+            "run_id": "old-run-id",
+            "status": "PASSED",
+        },
+    )
+
+    def fake_run(
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(
+        change_applier.subprocess,
+        "run",
+        fake_run,
+    )
+
+    assert (
+        change_applier.run_post_change_validation(
+            "old-run-id"
+        )
+        is False
+    )
+
+
+def test_run_post_change_validation_rejects_failed_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    tester_path = project_dir / "tester.py"
+    tester_path.write_text("print('test')\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        change_applier,
+        "PROJECT_FOLDER",
+        project_dir,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "TESTER_FILE",
+        tester_path,
+    )
+
+    def fake_run(
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=1,
+            stdout=b"",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(
+        change_applier.subprocess,
+        "run",
+        fake_run,
+    )
+
+    assert (
+        change_applier.run_post_change_validation(
+            "old-run-id"
+        )
+        is False
+    )
+
+
+def test_run_post_change_validation_rejects_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    tester_path = project_dir / "tester.py"
+    tester_path.write_text("print('test')\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        change_applier,
+        "PROJECT_FOLDER",
+        project_dir,
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "TESTER_FILE",
+        tester_path,
+    )
+
+    def raise_timeout(
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        raise subprocess.TimeoutExpired(
+            cmd=["python", str(tester_path)],
+            timeout=30,
+        )
+
+    monkeypatch.setattr(
+        change_applier.subprocess,
+        "run",
+        raise_timeout,
+    )
+
+    assert (
+        change_applier.run_post_change_validation(
+            "old-run-id"
+        )
+        is False
+    )
+
+
+def test_apply_change_uses_real_validation_and_keeps_change(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    target_path = project_dir / "rollback_target.txt"
+    original_content = "original value\n"
+    target_path.write_text(original_content, encoding="utf-8")
+
+    diagnosis: change_applier.DiagnosisRecord = {
+        "run_id": "diagnosis-run-id",
+        "timestamp": "diagnosis-time",
+        "test_timestamp": "test-time",
+        "test_status": "FAILED",
+        "diagnosis": {
+            "status": "FAILED",
+            "diagnosis": "Integration diagnosis",
+            "likely_cause": "Integration cause",
+            "file": "rollback_target.txt",
+            "line": 1,
+            "confidence": "HIGH",
+            "evidence": [],
+            "next_step": "Apply the change",
+            "proposed_change": "Use new content",
+            "affected_files": ["rollback_target.txt"],
+            "change_size": "SMALL",
+            "exact_change": {
+                "file": "rollback_target.txt",
+                "line": 1,
+                "old_text": original_content,
+                "new_text": "changed value\n",
+            },
+        },
+    }
+
+    permission: change_applier.PermissionRecord = {
+        "run_id": "diagnosis-run-id",
+        "diagnosis_timestamp": "diagnosis-time",
+        "permission_timestamp": "permission-time",
+        "decision": "APPROVED",
+        "file": "rollback_target.txt",
+        "line": 1,
+        "proposed_change": "Use new content",
+        "affected_files": ["rollback_target.txt"],
+        "change_size": "SMALL",
+        "exact_change": {
+            "file": "rollback_target.txt",
+            "line": 1,
+            "old_text": original_content,
+            "new_text": "changed value\n",
+        },
+    }
+
+    _prepare_real_tester_environment(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        exit_code=0,
+        previous_run_id="diagnosis-run-id",
+    )
+
+    monkeypatch.setattr(
+        change_applier,
+        "PROJECT_FOLDER",
+        project_dir,
+    )
+
+    success = change_applier.apply_change(diagnosis)
+
+    assert success is True
+    assert target_path.read_text(encoding="utf-8") == "changed value\n"
+    assert change_applier.can_apply_change(diagnosis, permission) is True
+
+
+def test_apply_change_rolls_back_when_real_validation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    target_path = project_dir / "rollback_target.txt"
+    original_content = "original value\n"
+    target_path.write_text(original_content, encoding="utf-8")
+
+    diagnosis: change_applier.DiagnosisRecord = {
+        "run_id": "diagnosis-run-id",
+        "timestamp": "diagnosis-time",
+        "test_timestamp": "test-time",
+        "test_status": "FAILED",
+        "diagnosis": {
+            "status": "FAILED",
+            "diagnosis": "Integration diagnosis",
+            "likely_cause": "Integration cause",
+            "file": "rollback_target.txt",
+            "line": 1,
+            "confidence": "HIGH",
+            "evidence": [],
+            "next_step": "Apply the change",
+            "proposed_change": "Use new content",
+            "affected_files": ["rollback_target.txt"],
+            "change_size": "SMALL",
+            "exact_change": {
+                "file": "rollback_target.txt",
+                "line": 1,
+                "old_text": original_content,
+                "new_text": "changed value\n",
+            },
+        },
+    }
+
+    _prepare_real_tester_environment(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        exit_code=1,
+        previous_run_id="diagnosis-run-id",
+    )
+
+    monkeypatch.setattr(
+        change_applier,
+        "PROJECT_FOLDER",
+        project_dir,
+    )
+
+    success = change_applier.apply_change(diagnosis)
+
+    assert success is False
+    assert target_path.read_text(encoding="utf-8") == original_content
