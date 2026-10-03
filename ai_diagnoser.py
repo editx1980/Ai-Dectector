@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from datetime import datetime, timezone
@@ -10,6 +11,11 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
+from change_transaction import (
+    TransactionLogError,
+    get_transaction,
+)
+
 
 PROJECT_FOLDER = Path(__file__).resolve().parent
 LOG_FOLDER = PROJECT_FOLDER / "logs"
@@ -17,6 +23,7 @@ LOG_FOLDER = PROJECT_FOLDER / "logs"
 EVIDENCE_FILE = LOG_FOLDER / "evidence.jsonl"
 CONTEXT_FILE = LOG_FOLDER / "project_context.jsonl"
 DIAGNOSES_FILE = LOG_FOLDER / "diagnoses.jsonl"
+CHANGE_TRANSACTIONS_FILE = LOG_FOLDER / "change_transactions.jsonl"
 
 MODEL_NAME = "gemini-3.5-flash-lite"
 
@@ -600,6 +607,7 @@ def diagnose_evidence(
 def write_diagnosis(
     evidence: JsonObject,
     diagnosis: Diagnosis,
+    transaction_id: str | None = None,
 ) -> None:
     LOG_FOLDER.mkdir(
         parents=True,
@@ -632,6 +640,22 @@ def write_diagnosis(
             diagnosis_data,
         ),
     }
+    if transaction_id is not None:
+        transaction = get_transaction(
+            transaction_id,
+            CHANGE_TRANSACTIONS_FILE,
+        )
+        diagnosis_run_id = get_string(evidence, "run_id")
+        if (
+            transaction is None
+            or transaction["state"] != "PROPOSED"
+            or transaction["diagnosis_run_id"] != diagnosis_run_id
+            or transaction["pre_change_run_id"] != diagnosis_run_id
+        ):
+            raise TransactionLogError(
+                "Transaction ID does not match the diagnosed test run."
+            )
+        record["transaction_id"] = transaction_id
 
     with DIAGNOSES_FILE.open(
         "a",
@@ -766,7 +790,7 @@ def print_diagnosis(
     print("=" * 50)
 
 
-def main() -> None:
+def main(transaction_id: str | None = None) -> None:
     evidence_records = load_evidence()
 
     if not evidence_records:
@@ -811,6 +835,7 @@ def main() -> None:
             write_diagnosis(
                 evidence,
                 diagnosis,
+                transaction_id,
             )
 
             print_diagnosis(
@@ -822,7 +847,11 @@ def main() -> None:
                 f"Failed to diagnose evidence: "
                 f"{error}"
             )
+            if transaction_id is not None:
+                raise SystemExit(1) from error
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--transaction-id")
+    main(parser.parse_args().transaction_id)

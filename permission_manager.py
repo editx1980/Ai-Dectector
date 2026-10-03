@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
+
+from change_transaction import (
+    InvalidTransactionTransition,
+    TransactionLogError,
+    get_transaction,
+    transition_transaction,
+)
 
 
 PROJECT_FOLDER = Path(__file__).resolve().parent
@@ -11,6 +19,7 @@ LOG_FOLDER = PROJECT_FOLDER / "logs"
 
 DIAGNOSES_FILE = LOG_FOLDER / "diagnoses.jsonl"
 PERMISSIONS_FILE = LOG_FOLDER / "permissions.jsonl"
+CHANGE_TRANSACTIONS_FILE = LOG_FOLDER / "change_transactions.jsonl"
 
 
 ChangeSize = Literal[
@@ -55,6 +64,7 @@ class DiagnosisRecord(TypedDict):
     test_timestamp: str
     test_status: str
     diagnosis: DiagnosisData
+    transaction_id: NotRequired[str | None]
 
 
 class PermissionRecord(TypedDict):
@@ -68,6 +78,7 @@ class PermissionRecord(TypedDict):
     affected_files: list[str]
     change_size: ChangeSize
     exact_change: ExactChange
+    transaction_id: NotRequired[str | None]
 
 
 def load_latest_diagnosis() -> DiagnosisRecord | None:
@@ -128,6 +139,8 @@ def parse_diagnosis(
         "test_status"
     )
 
+    transaction_id = value.get("transaction_id")
+
     diagnosis_value = value.get(
         "diagnosis"
     )
@@ -159,6 +172,11 @@ def parse_diagnosis(
     ):
         return None
 
+    if transaction_id is not None and (
+        not isinstance(transaction_id, str) or not transaction_id
+    ):
+        return None
+
     if not isinstance(
         diagnosis_value,
         dict,
@@ -177,13 +195,16 @@ def parse_diagnosis(
     if diagnosis is None:
         return None
 
-    return {
+    record: DiagnosisRecord = {
         "run_id": run_id,
         "timestamp": timestamp,
         "test_timestamp": test_timestamp,
         "test_status": test_status,
         "diagnosis": diagnosis,
     }
+    if isinstance(transaction_id, str):
+        record["transaction_id"] = transaction_id
+    return record
 
 
 def parse_exact_change(
@@ -432,7 +453,8 @@ def parse_diagnosis_data(
 def save_permission(
     diagnosis: DiagnosisRecord,
     decision: Decision,
-) -> None:
+    transaction_id: str | None = None,
+) -> PermissionRecord:
     diagnosis_data = diagnosis[
         "diagnosis"
     ]
@@ -471,6 +493,8 @@ def save_permission(
             "exact_change"
         ],
     }
+    if transaction_id is not None:
+        record["transaction_id"] = transaction_id
 
     LOG_FOLDER.mkdir(
         parents=True,
@@ -488,6 +512,8 @@ def save_permission(
         )
 
         file.write("\n")
+
+    return record
 
 
 def print_change_request(
@@ -613,14 +639,52 @@ def ask_permission() -> Decision:
         )
 
 
-def main() -> None:
+def main(transaction_id: str | None = None) -> int:
     diagnosis = load_latest_diagnosis()
 
     if diagnosis is None:
         print(
             "No valid diagnosis found."
         )
-        return
+        return 1
+
+    if transaction_id is not None:
+        try:
+            transaction = get_transaction(
+                transaction_id,
+                CHANGE_TRANSACTIONS_FILE,
+            )
+        except TransactionLogError as error:
+            print(f"Transaction audit log could not be read: {error}")
+            return 1
+        if (
+            diagnosis.get("transaction_id") != transaction_id
+            or transaction is None
+            or transaction["state"] != "PROPOSED"
+            or transaction["diagnosis_run_id"] != diagnosis["run_id"]
+            or transaction["pre_change_run_id"] != diagnosis["run_id"]
+        ):
+            print("Transaction ID does not match this diagnosis lifecycle.")
+            return 1
+
+        try:
+            transition_transaction(
+                transaction_id,
+                "PROPOSED",
+                "AWAITING_PERMISSION",
+                {
+                    "diagnosis_timestamp": diagnosis["timestamp"],
+                    "evidence": ["Awaiting the user's permission decision."],
+                },
+                CHANGE_TRANSACTIONS_FILE,
+            )
+        except (
+            InvalidTransactionTransition,
+            OSError,
+            TransactionLogError,
+        ) as error:
+            print(f"Transaction audit update failed: {error}")
+            return 1
 
     diagnosis_data = diagnosis[
         "diagnosis"
@@ -632,7 +696,27 @@ def main() -> None:
         print(
             "No change has been proposed."
         )
-        return
+        if transaction_id is not None:
+            try:
+                transition_transaction(
+                    transaction_id,
+                    "AWAITING_PERMISSION",
+                    "INCONCLUSIVE",
+                    {
+                        "evidence": [
+                            "Diagnosis did not propose an exact change."
+                        ],
+                    },
+                    CHANGE_TRANSACTIONS_FILE,
+                )
+            except (
+                InvalidTransactionTransition,
+                OSError,
+                TransactionLogError,
+            ) as error:
+                print(f"Transaction audit update failed: {error}")
+                return 1
+        return 0
 
     print_change_request(
         diagnosis
@@ -640,10 +724,41 @@ def main() -> None:
 
     decision = ask_permission()
 
-    save_permission(
-        diagnosis,
-        decision,
-    )
+    try:
+        permission = save_permission(
+            diagnosis,
+            decision,
+            transaction_id,
+        )
+        if transaction_id is not None:
+            new_state = (
+                "APPROVED"
+                if decision == "APPROVED"
+                else "REJECTED"
+            )
+            transition_transaction(
+                transaction_id,
+                "AWAITING_PERMISSION",
+                new_state,
+                {
+                    "permission_timestamp": permission[
+                        "permission_timestamp"
+                    ],
+                    "permission_decision": decision,
+                    "affected_files": permission["affected_files"],
+                    "evidence": [
+                        f"Permission decision recorded: {decision}."
+                    ],
+                },
+                CHANGE_TRANSACTIONS_FILE,
+            )
+    except (
+        InvalidTransactionTransition,
+        OSError,
+        TransactionLogError,
+    ) as error:
+        print(f"Permission or transaction record could not be saved: {error}")
+        return 1
 
     print()
 
@@ -662,6 +777,10 @@ def main() -> None:
             "No files have been modified."
         )
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--transaction-id")
+    raise SystemExit(main(parser.parse_args().transaction_id))

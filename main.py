@@ -6,6 +6,14 @@ import subprocess
 import sys
 import time
 
+from change_transaction import (
+    ChangeTransaction,
+    InvalidTransactionTransition,
+    TransactionLogError,
+    create_transaction,
+    get_transaction,
+    transition_transaction,
+)
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
@@ -14,6 +22,7 @@ PROJECT_FOLDER = Path(__file__).resolve().parent
 LOG_FOLDER = PROJECT_FOLDER / "logs"
 LOG_FILE = LOG_FOLDER / "events.jsonl"
 TEST_RESULTS_FILE = LOG_FOLDER / "test_results.jsonl"
+CHANGE_TRANSACTIONS_FILE = LOG_FOLDER / "change_transactions.jsonl"
 
 PIPELINE_COOLDOWN_SECONDS = 1.0
 EVENT_DEBOUNCE_SECONDS = 0.5
@@ -36,6 +45,7 @@ INTERNAL_FILES = {
     "ai_diagnoser.py",
     "permission_manager.py",
     "change_applier.py",
+    "change_transaction.py",
     "project_scanner.py",
     "project_context.py",
     "static_analyzer.py",
@@ -222,16 +232,54 @@ def get_latest_test_status() -> str | None:
             if not line.strip():
                 continue
 
-            result = json.loads(line)
+            try:
+                result: object = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(result, dict):
+                continue
             status = result.get("status")
 
             if isinstance(status, str):
                 return status
 
-    except (
-        OSError,
-        json.JSONDecodeError,
-    ):
+    except OSError:
+        return None
+
+    return None
+
+
+def get_latest_test_run_id() -> str | None:
+    if not TEST_RESULTS_FILE.exists():
+        return None
+
+    try:
+        with TEST_RESULTS_FILE.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            lines = file.readlines()
+
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+
+            try:
+                result: object = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if not isinstance(result, dict):
+                continue
+
+            run_id = result.get("run_id")
+            status = result.get("status")
+            if status != "FAILED":
+                return None
+            if isinstance(run_id, str) and run_id:
+                return run_id
+            return None
+    except OSError:
         return None
 
     return None
@@ -239,6 +287,7 @@ def get_latest_test_status() -> str | None:
 
 def run_command(
     script_name: str,
+    transaction_id: str | None = None,
 ) -> bool:
     script_path = (
         PROJECT_FOLDER / script_name
@@ -249,11 +298,17 @@ def run_command(
         f"Running {script_name}..."
     )
 
+    command = [
+        sys.executable,
+        str(script_path),
+    ]
+    if transaction_id is not None:
+        command.extend(
+            ["--transaction-id", transaction_id]
+        )
+
     result = subprocess.run(
-        [
-            sys.executable,
-            str(script_path),
-        ],
+        command,
         cwd=PROJECT_FOLDER,
         check=False,
     )
@@ -268,6 +323,45 @@ def run_command(
         return False
 
     return True
+
+
+def mark_transaction_failed(
+    transaction_id: str,
+    reason: str,
+) -> None:
+    try:
+        transaction = get_transaction(
+            transaction_id,
+            CHANGE_TRANSACTIONS_FILE,
+        )
+        if transaction is None:
+            print("Transaction audit record is missing.")
+            return
+        if transaction["state"] in {
+            "REJECTED",
+            "SUCCEEDED",
+            "ROLLED_BACK",
+            "INCONCLUSIVE",
+            "FAILED",
+        }:
+            return
+
+        transition_transaction(
+            transaction_id,
+            transaction["state"],
+            "FAILED",
+            {
+                "final_outcome": "FAILED",
+                "evidence": [reason],
+            },
+            CHANGE_TRANSACTIONS_FILE,
+        )
+    except (
+        InvalidTransactionTransition,
+        OSError,
+        TransactionLogError,
+    ) as error:
+        print(f"Could not record transaction failure: {error}")
 
 
 def run_overseer_pipeline() -> None:
@@ -324,6 +418,22 @@ def run_overseer_pipeline() -> None:
         )
         return
 
+    failed_run_id = get_latest_test_run_id()
+    if failed_run_id is None:
+        print("Pipeline stopped: failed test run ID is unavailable.")
+        return
+
+    try:
+        transaction: ChangeTransaction = create_transaction(
+            failed_run_id,
+            failed_run_id,
+            CHANGE_TRANSACTIONS_FILE,
+        )
+    except (OSError, TransactionLogError, ValueError) as error:
+        print(f"Could not start change transaction: {error}")
+        return
+    transaction_id = transaction["transaction_id"]
+
     print()
     print(
         "Tests failed. "
@@ -339,14 +449,78 @@ def run_overseer_pipeline() -> None:
     ]
 
     for script_name in pipeline:
+        stage_transaction_id = (
+            transaction_id
+            if script_name
+            in {
+                "ai_diagnoser.py",
+                "permission_manager.py",
+                "change_applier.py",
+            }
+            else None
+        )
         if not run_command(
-            script_name
+            script_name,
+            stage_transaction_id,
         ):
+            mark_transaction_failed(
+                transaction_id,
+                f"{script_name} exited unsuccessfully.",
+            )
             print()
             print(
                 "Pipeline stopped."
             )
             return
+
+        if script_name == "permission_manager.py":
+            try:
+                current_transaction = get_transaction(
+                    transaction_id,
+                    CHANGE_TRANSACTIONS_FILE,
+                )
+            except TransactionLogError as error:
+                print(f"Could not verify permission transaction: {error}")
+                return
+
+            if current_transaction is None:
+                print("Permission transaction record is missing.")
+                return
+            if current_transaction["state"] == "REJECTED":
+                print("Change transaction ended: permission was rejected.")
+                return
+            if current_transaction["state"] == "INCONCLUSIVE":
+                print("Change transaction ended without an exact proposal.")
+                return
+            if current_transaction["state"] != "APPROVED":
+                mark_transaction_failed(
+                    transaction_id,
+                    "Permission stage did not record an approval.",
+                )
+                print("Pipeline stopped: permission approval is unconfirmed.")
+                return
+
+    try:
+        final_transaction = get_transaction(
+            transaction_id,
+            CHANGE_TRANSACTIONS_FILE,
+        )
+    except TransactionLogError as error:
+        print(f"Could not verify final transaction outcome: {error}")
+        return
+
+    if final_transaction is None:
+        print("Final transaction record is missing.")
+        return
+    if not (
+        final_transaction["state"] == "SUCCEEDED"
+        and final_transaction["final_outcome"] == "SUCCESS"
+    ):
+        print(
+            "Pipeline finished without a successful change outcome: "
+            f"{final_transaction['final_outcome'] or final_transaction['state']}."
+        )
+        return
 
     print()
     print("=" * 50)

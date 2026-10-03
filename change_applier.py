@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
+from change_transaction import (
+    ChangeTransaction,
+    InvalidTransactionTransition,
+    TransactionLogError,
+    TransactionState,
+    TransactionUpdate,
+    get_transaction,
+    transition_transaction,
+)
 from runtime_monitor import COMMAND_TIMEOUT_SECONDS
 from scope_analyzer import (
     ScopeStatus,
@@ -30,6 +39,7 @@ DIAGNOSES_FILE = LOG_FOLDER / "diagnoses.jsonl"
 PERMISSIONS_FILE = LOG_FOLDER / "permissions.jsonl"
 TEST_RESULTS_FILE = LOG_FOLDER / "test_results.jsonl"
 VALIDATION_RESULTS_FILE = LOG_FOLDER / "validation_results.jsonl"
+CHANGE_TRANSACTIONS_FILE = LOG_FOLDER / "change_transactions.jsonl"
 TESTER_FILE = PROJECT_FOLDER / "tester.py"
 
 
@@ -67,6 +77,7 @@ class DiagnosisRecord(TypedDict):
     test_timestamp: str
     test_status: str
     diagnosis: DiagnosisData
+    transaction_id: NotRequired[str | None]
 
 
 class PermissionRecord(TypedDict):
@@ -80,11 +91,13 @@ class PermissionRecord(TypedDict):
     affected_files: list[str]
     change_size: str
     exact_change: ExactChange
+    transaction_id: NotRequired[str | None]
 
 
 class PostChangeValidationResult(TypedDict):
     previous_run_id: str
     post_change_run_id: str | None
+    post_change_test_status: ValidationStatus
     change_aware_validation_status: ValidationStatus
     validation_evidence: list[str]
 
@@ -96,6 +109,7 @@ class UnifiedValidationRecord(TypedDict):
     timestamp: str
     previous_run_id: str
     post_change_run_id: str | None
+    post_change_test_status: ValidationStatus
     change_file: str
     expected_files: list[str]
     actual_files: list[str] | None
@@ -203,6 +217,7 @@ def parse_diagnosis(
     timestamp = value.get("timestamp")
     test_timestamp = value.get("test_timestamp")
     test_status = value.get("test_status")
+    transaction_id = value.get("transaction_id")
     diagnosis_value = value.get("diagnosis")
 
     if not isinstance(run_id, str) or not run_id:
@@ -215,6 +230,10 @@ def parse_diagnosis(
         return None
 
     if not isinstance(test_status, str):
+        return None
+    if transaction_id is not None and (
+        not isinstance(transaction_id, str) or not transaction_id
+    ):
         return None
 
     if not isinstance(diagnosis_value, dict):
@@ -230,13 +249,16 @@ def parse_diagnosis(
     if diagnosis is None:
         return None
 
-    return {
+    record: DiagnosisRecord = {
         "run_id": run_id,
         "timestamp": timestamp,
         "test_timestamp": test_timestamp,
         "test_status": test_status,
         "diagnosis": diagnosis,
     }
+    if isinstance(transaction_id, str):
+        record["transaction_id"] = transaction_id
+    return record
 
 
 def parse_diagnosis_data(
@@ -253,6 +275,7 @@ def parse_diagnosis_data(
     proposed_change = value.get("proposed_change")
     affected_files = value.get("affected_files")
     change_size = value.get("change_size")
+    transaction_id = value.get("transaction_id")
     exact_change = parse_exact_change(
         value.get("exact_change")
     )
@@ -413,6 +436,11 @@ def parse_permission(
     ):
         return None
 
+    if transaction_id is not None and (
+        not isinstance(transaction_id, str) or not transaction_id
+    ):
+        return None
+
     if decision not in {
         "APPROVED",
         "REJECTED",
@@ -465,7 +493,7 @@ def parse_permission(
     if exact_change is None:
         return None
 
-    return {
+    record: PermissionRecord = {
         "run_id": run_id,
         "diagnosis_timestamp": diagnosis_timestamp,
         "permission_timestamp": permission_timestamp,
@@ -480,6 +508,9 @@ def parse_permission(
         "change_size": change_size,
         "exact_change": exact_change,
     }
+    if isinstance(transaction_id, str):
+        record["transaction_id"] = transaction_id
+    return record
 
 
 def permission_matches_diagnosis(
@@ -489,6 +520,12 @@ def permission_matches_diagnosis(
     diagnosis_data = diagnosis["diagnosis"]
 
     if permission["decision"] != "APPROVED":
+        return False
+
+    if (
+        diagnosis.get("transaction_id")
+        != permission.get("transaction_id")
+    ):
         return False
 
     if permission["run_id"] != diagnosis["run_id"]:
@@ -686,7 +723,7 @@ def apply_exact_change(
         print(
             f"Write error: {error}"
         )
-        return False, None, None
+        return False, target, current_content
 
     print()
     print("Change applied.")
@@ -814,6 +851,7 @@ def analyze_post_change_validation(
         return {
             "previous_run_id": expected_previous_run_id,
             "post_change_run_id": None,
+            "post_change_test_status": "FAILED",
             "change_aware_validation_status": "FAILED",
             "validation_evidence": [
                 "tester.py was not found."
@@ -841,6 +879,7 @@ def analyze_post_change_validation(
         return {
             "previous_run_id": expected_previous_run_id,
             "post_change_run_id": None,
+            "post_change_test_status": "FAILED",
             "change_aware_validation_status": "FAILED",
             "validation_evidence": [
                 "tester.py exceeded the configured timeout."
@@ -857,13 +896,15 @@ def analyze_post_change_validation(
         return {
             "previous_run_id": expected_previous_run_id,
             "post_change_run_id": None,
+            "post_change_test_status": "FAILED",
             "change_aware_validation_status": "FAILED",
             "validation_evidence": [
                 f"Could not execute tester.py: {error}"
             ],
         }
 
-    if result.returncode != 0:
+    test_process_failed = result.returncode != 0
+    if test_process_failed:
         print()
         print(
             "Post-change validation failed."
@@ -872,14 +913,6 @@ def analyze_post_change_validation(
             f"tester.py exited with code "
             f"{result.returncode}."
         )
-        return {
-            "previous_run_id": expected_previous_run_id,
-            "post_change_run_id": None,
-            "change_aware_validation_status": "FAILED",
-            "validation_evidence": [
-                f"tester.py exited with code {result.returncode}."
-            ],
-        }
 
     try:
         current_result = get_latest_test_result()
@@ -892,6 +925,9 @@ def analyze_post_change_validation(
         return {
             "previous_run_id": expected_previous_run_id,
             "post_change_run_id": None,
+            "post_change_test_status": (
+                "FAILED" if test_process_failed else "INCONCLUSIVE"
+            ),
             "change_aware_validation_status": "INCONCLUSIVE",
             "validation_evidence": [
                 f"Test result log could not be read: {error}"
@@ -909,6 +945,9 @@ def analyze_post_change_validation(
         return {
             "previous_run_id": expected_previous_run_id,
             "post_change_run_id": None,
+            "post_change_test_status": (
+                "FAILED" if test_process_failed else "INCONCLUSIVE"
+            ),
             "change_aware_validation_status": "INCONCLUSIVE",
             "validation_evidence": [
                 "No post-change test result was recorded."
@@ -926,6 +965,9 @@ def analyze_post_change_validation(
         return {
             "previous_run_id": expected_previous_run_id,
             "post_change_run_id": None,
+            "post_change_test_status": (
+                "FAILED" if test_process_failed else "INCONCLUSIVE"
+            ),
             "change_aware_validation_status": "INCONCLUSIVE",
             "validation_evidence": [
                 "The latest test result is missing required data."
@@ -941,6 +983,9 @@ def analyze_post_change_validation(
         return {
             "previous_run_id": expected_previous_run_id,
             "post_change_run_id": post_change_result["run_id"],
+            "post_change_test_status": (
+                "FAILED" if test_process_failed else "INCONCLUSIVE"
+            ),
             "change_aware_validation_status": "FAILED",
             "validation_evidence": [
                 "The test run ID did not change."
@@ -956,6 +1001,9 @@ def analyze_post_change_validation(
         return {
             "previous_run_id": expected_previous_run_id,
             "post_change_run_id": post_change_result["run_id"],
+            "post_change_test_status": (
+                "FAILED" if test_process_failed else "INCONCLUSIVE"
+            ),
             "change_aware_validation_status": "FAILED",
             "validation_evidence": [
                 "The latest result was already present before validation."
@@ -980,6 +1028,14 @@ def analyze_post_change_validation(
     return {
         "previous_run_id": expected_previous_run_id,
         "post_change_run_id": post_change_result["run_id"],
+        "post_change_test_status": (
+            "PASSED"
+            if (
+                post_change_result["status"] == "PASSED"
+                and not test_process_failed
+            )
+            else "FAILED"
+        ),
         "change_aware_validation_status": comparison[
             "validation_status"
         ],
@@ -1000,17 +1056,20 @@ def run_post_change_validation(
 
 
 def combine_validation_statuses(
+    post_change_test_status: ValidationStatus,
     change_aware_status: ValidationStatus,
     scope_status: ScopeStatus,
 ) -> ValidationStatus:
     if (
-        change_aware_status == "FAILED"
+        post_change_test_status == "FAILED"
+        or change_aware_status == "FAILED"
         or scope_status == "FAILED"
     ):
         return "FAILED"
 
     if (
-        change_aware_status == "INCONCLUSIVE"
+        post_change_test_status == "INCONCLUSIVE"
+        or change_aware_status == "INCONCLUSIVE"
         or scope_status == "INCONCLUSIVE"
     ):
         return "INCONCLUSIVE"
@@ -1046,19 +1105,123 @@ def write_validation_result(
     return True
 
 
+def transition_or_report(
+    transaction_id: str,
+    expected_state: TransactionState,
+    new_state: TransactionState,
+    updates: TransactionUpdate,
+) -> bool:
+    try:
+        transition_transaction(
+            transaction_id,
+            expected_state,
+            new_state,
+            updates,
+            CHANGE_TRANSACTIONS_FILE,
+        )
+    except (
+        InvalidTransactionTransition,
+        OSError,
+        TransactionLogError,
+    ) as error:
+        print(f"Transaction audit update failed: {error}")
+        return False
+    return True
+
+
+def record_terminal_transition(
+    transaction_id: str,
+    expected_states: frozenset[TransactionState],
+    new_state: Literal["ROLLED_BACK", "FAILED"],
+    updates: TransactionUpdate,
+) -> bool:
+    try:
+        transaction = get_transaction(
+            transaction_id,
+            CHANGE_TRANSACTIONS_FILE,
+        )
+    except TransactionLogError as error:
+        print(f"Transaction audit log could not be read: {error}")
+        return False
+
+    if transaction is None:
+        print("Transaction audit record is missing.")
+        return False
+    if transaction["state"] == new_state:
+        return True
+    if transaction["state"] not in expected_states:
+        print(
+            "Transaction could not be finalized from state "
+            f"{transaction['state']}."
+        )
+        return False
+
+    return transition_or_report(
+        transaction_id,
+        transaction["state"],
+        new_state,
+        updates,
+    )
+
+
 def apply_change(
     diagnosis: DiagnosisRecord,
     permission: PermissionRecord,
+    transaction_id: str | None = None,
 ) -> bool:
-    if not can_apply_change(
-        diagnosis,
-        permission,
+    if (
+        transaction_id is None
+        or diagnosis.get("transaction_id") != transaction_id
+        or permission.get("transaction_id") != transaction_id
+        or not can_apply_change(diagnosis, permission)
     ):
         print("No matching approved permission found.")
         print("No files have been modified.")
         return False
 
-    transaction_id = str(uuid.uuid4())
+    try:
+        transaction: ChangeTransaction | None = get_transaction(
+            transaction_id,
+            CHANGE_TRANSACTIONS_FILE,
+        )
+    except TransactionLogError as error:
+        print(f"Transaction audit log could not be read: {error}")
+        return False
+
+    if (
+        transaction is None
+        or transaction["state"] != "APPROVED"
+        or transaction["diagnosis_run_id"] != diagnosis["run_id"]
+        or transaction["pre_change_run_id"] != diagnosis["run_id"]
+        or transaction["diagnosis_timestamp"] != diagnosis["timestamp"]
+        or transaction["permission_timestamp"]
+        != permission["permission_timestamp"]
+        or transaction["permission_decision"] != "APPROVED"
+        or transaction["affected_files"] != permission["affected_files"]
+    ):
+        print("Transaction does not match the approved change lifecycle.")
+        print("No files have been modified.")
+        return False
+
+    if not transition_or_report(
+        transaction_id,
+        "APPROVED",
+        "APPLYING",
+        {"evidence": ["Applier accepted the matched approved permission."]},
+    ):
+        record_terminal_transition(
+            transaction_id,
+            frozenset({"APPROVED", "APPLYING"}),
+            "FAILED",
+            {
+                "evidence": [
+                    "Could not persist the APPLYING state before writing."
+                ],
+            },
+        )
+        print("No files have been modified.")
+        return False
+
     expected_files = permission["affected_files"]
 
     applied, target, original_content = (
@@ -1069,8 +1232,29 @@ def apply_change(
 
     if not applied:
         print()
-        print(
-            "No files have been modified."
+        rollback_succeeded = False
+        if target is not None and original_content is not None:
+            rollback_succeeded = restore_original_file(
+                target,
+                original_content,
+            )
+        record_terminal_transition(
+            transaction_id,
+            frozenset({"APPLYING"}),
+            "ROLLED_BACK" if rollback_succeeded else "FAILED",
+            {
+                "rollback_succeeded": rollback_succeeded,
+                "final_outcome": (
+                    "ROLLED_BACK"
+                    if rollback_succeeded
+                    else "FAILED"
+                ),
+                "evidence": [
+                    "Exact change could not be applied."
+                    if not rollback_succeeded
+                    else "Partial write was restored."
+                ],
+            },
         )
         return False
 
@@ -1079,11 +1263,57 @@ def apply_change(
         print(
             "Change cannot be safely validated."
         )
+        record_terminal_transition(
+            transaction_id,
+            frozenset({"APPLYING"}),
+            "FAILED",
+            {
+                "rollback_succeeded": False,
+                "final_outcome": "FAILED",
+                "evidence": [
+                    "Applier did not return rollback material after writing."
+                ],
+            },
+        )
         return False
 
     actual_files = [str(target)]
+    if not transition_or_report(
+        transaction_id,
+        "APPLYING",
+        "VALIDATING",
+        {
+            "actual_changed_files": actual_files,
+            "evidence": [
+                "Exact change was applied; post-change validation started."
+            ],
+        },
+    ):
+        rollback_succeeded = restore_original_file(
+            target,
+            original_content,
+        )
+        record_terminal_transition(
+            transaction_id,
+            frozenset({"APPLYING", "VALIDATING"}),
+            "ROLLED_BACK" if rollback_succeeded else "FAILED",
+            {
+                "actual_changed_files": actual_files,
+                "rollback_succeeded": rollback_succeeded,
+                "final_outcome": (
+                    "ROLLED_BACK"
+                    if rollback_succeeded
+                    else "FAILED"
+                ),
+                "evidence": [
+                    "Transaction validation-start event could not be persisted."
+                ],
+            },
+        )
+        return False
+
     post_change_validation = analyze_post_change_validation(
-        diagnosis["run_id"],
+        transaction["pre_change_run_id"],
         expected_files,
     )
     scope_validation: ScopeValidationResult = compare_scopes(
@@ -1092,6 +1322,7 @@ def apply_change(
         PROJECT_FOLDER,
     )
     final_status = combine_validation_statuses(
+        post_change_validation["post_change_test_status"],
         post_change_validation["change_aware_validation_status"],
         scope_validation["scope_status"],
     )
@@ -1116,6 +1347,9 @@ def apply_change(
         "post_change_run_id": post_change_validation[
             "post_change_run_id"
         ],
+        "post_change_test_status": post_change_validation[
+            "post_change_test_status"
+        ],
         "change_file": str(target),
         "expected_files": scope_validation["expected_files"],
         "actual_files": scope_validation["actual_files"],
@@ -1134,15 +1368,51 @@ def apply_change(
         ],
     }
 
-    if not write_validation_result(validation_record):
+    validation_record_persisted = write_validation_result(
+        validation_record
+    )
+    if not validation_record_persisted:
         final_status = "FAILED"
+        validation_record["final_validation_status"] = "FAILED"
+
+    transaction_updates: TransactionUpdate = {
+        "post_change_run_id": post_change_validation[
+            "post_change_run_id"
+        ],
+        "post_change_test_status": post_change_validation[
+            "post_change_test_status"
+        ],
+        "change_aware_validation_status": post_change_validation[
+            "change_aware_validation_status"
+        ],
+        "scope_validation_status": scope_validation["scope_status"],
+        "final_validation_status": final_status,
+        "actual_changed_files": (
+            scope_validation["actual_files"] or []
+        ),
+        "evidence": [
+            *post_change_validation["validation_evidence"],
+            *scope_validation["evidence"],
+            *(
+                []
+                if validation_record_persisted
+                else ["Unified validation result could not be persisted."]
+            ),
+        ],
+    }
 
     if final_status == "PASSED":
-        print(
-            "Change successful."
-        )
-        print("All required validation stages passed.")
-        return True
+        transaction_updates["rollback_succeeded"] = False
+        if transition_or_report(
+            transaction_id,
+            "VALIDATING",
+            "SUCCEEDED",
+            transaction_updates,
+        ):
+            print("Change successful.")
+            print("All required validation stages passed.")
+            return True
+        print("Transaction success could not be persisted; rolling back.")
 
     print(
         f"Change was not accepted: validation status is {final_status}."
@@ -1154,6 +1424,26 @@ def apply_change(
     rollback_succeeded = restore_original_file(
         target,
         original_content,
+    )
+    transaction_updates["rollback_succeeded"] = rollback_succeeded
+    transaction_updates["final_outcome"] = (
+        "ROLLED_BACK"
+        if rollback_succeeded
+        else "FAILED"
+    )
+    transaction_updates["evidence"] = [
+        *transaction_updates.get("evidence", []),
+        (
+            "Rollback completed successfully."
+            if rollback_succeeded
+            else "Rollback failed; original content could not be restored."
+        ),
+    ]
+    record_terminal_transition(
+        transaction_id,
+        frozenset({"VALIDATING", "SUCCEEDED"}),
+        "ROLLED_BACK" if rollback_succeeded else "FAILED",
+        transaction_updates,
     )
 
     print()
@@ -1180,14 +1470,18 @@ def apply_change(
     return False
 
 
-def main() -> None:
+def main(transaction_id: str | None = None) -> int:
     diagnosis = load_latest_diagnosis()
 
     if diagnosis is None:
         print(
             "No valid diagnosis found."
         )
-        return
+        return 1
+
+    if transaction_id is None:
+        print("A transaction ID is required to apply a change.")
+        return 1
 
     permission = load_latest_permission()
 
@@ -1201,13 +1495,33 @@ def main() -> None:
         print(
             "No files have been modified."
         )
-        return
+        return 1
 
-    apply_change(
+    succeeded = apply_change(
         diagnosis,
         permission,
+        transaction_id,
+    )
+    if succeeded:
+        return 0
+
+    try:
+        transaction = get_transaction(
+            transaction_id,
+            CHANGE_TRANSACTIONS_FILE,
+        )
+    except TransactionLogError:
+        return 1
+
+    return (
+        0
+        if transaction is not None
+        and transaction["state"] == "ROLLED_BACK"
+        else 1
     )
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--transaction-id")
+    raise SystemExit(main(parser.parse_args().transaction_id))

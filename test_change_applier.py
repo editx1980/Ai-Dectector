@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import change_applier
+import change_transaction
 
 
 PROJECT_FOLDER = Path(__file__).resolve().parent
@@ -27,6 +28,53 @@ def make_approved_permission(
         "change_size": diagnosis_data["change_size"],
         "exact_change": diagnosis_data["exact_change"],
     }
+
+
+def prepare_approved_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    diagnosis: change_applier.DiagnosisRecord,
+    permission: change_applier.PermissionRecord,
+    log_path: Path | None = None,
+) -> str:
+    transaction_log = (
+        log_path
+        if log_path is not None
+        else tmp_path / "logs" / "change_transactions.jsonl"
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "CHANGE_TRANSACTIONS_FILE",
+        transaction_log,
+    )
+    transaction = change_transaction.create_transaction(
+        diagnosis["run_id"],
+        diagnosis["run_id"],
+        transaction_log,
+    )
+    transaction_id = transaction["transaction_id"]
+    diagnosis["transaction_id"] = transaction_id
+    permission["transaction_id"] = transaction_id
+
+    change_transaction.transition_transaction(
+        transaction_id,
+        "PROPOSED",
+        "AWAITING_PERMISSION",
+        {"diagnosis_timestamp": diagnosis["timestamp"]},
+        transaction_log,
+    )
+    change_transaction.transition_transaction(
+        transaction_id,
+        "AWAITING_PERMISSION",
+        "APPROVED",
+        {
+            "permission_timestamp": permission["permission_timestamp"],
+            "permission_decision": "APPROVED",
+            "affected_files": permission["affected_files"],
+        },
+        transaction_log,
+    )
+    return transaction_id
 
 
 def test_apply_change_rolls_back_when_validation_fails(
@@ -68,6 +116,13 @@ def test_apply_change_rolls_back_when_validation_fails(
             },
         },
     }
+    permission = make_approved_permission(diagnosis)
+    transaction_id = prepare_approved_transaction(
+        monkeypatch,
+        tmp_path,
+        diagnosis,
+        permission,
+    )
 
     def failed_validation(
         _run_id: str,
@@ -76,6 +131,7 @@ def test_apply_change_rolls_back_when_validation_fails(
         return {
             "previous_run_id": _run_id,
             "post_change_run_id": "new-run-id",
+            "post_change_test_status": "FAILED",
             "change_aware_validation_status": "FAILED",
             "validation_evidence": ["Simulated failed validation."],
         }
@@ -94,7 +150,8 @@ def test_apply_change_rolls_back_when_validation_fails(
     try:
         success = change_applier.apply_change(
             diagnosis,
-            make_approved_permission(diagnosis),
+            permission,
+            transaction_id,
         )
 
         assert success is False
@@ -414,6 +471,7 @@ def test_approved_permission_allows_change_after_validation(
         return {
             "previous_run_id": _run_id,
             "post_change_run_id": "new-run-id",
+            "post_change_test_status": "PASSED",
             "change_aware_validation_status": "PASSED",
             "validation_evidence": ["Validation passed."],
         }
@@ -428,6 +486,13 @@ def test_approved_permission_allows_change_after_validation(
         "VALIDATION_RESULTS_FILE",
         tmp_path / "logs" / "validation_results.jsonl",
     )
+    permission = make_approved_permission(diagnosis)
+    transaction_id = prepare_approved_transaction(
+        monkeypatch,
+        tmp_path,
+        diagnosis,
+        permission,
+    )
 
     try:
         assert (
@@ -441,6 +506,7 @@ def test_approved_permission_allows_change_after_validation(
         success = change_applier.apply_change(
             diagnosis,
             permission,
+            transaction_id,
         )
 
         assert success is True
@@ -926,8 +992,18 @@ def test_apply_change_uses_real_validation_and_keeps_change(
         project_dir,
     )
 
+    transaction_id = prepare_approved_transaction(
+        monkeypatch,
+        tmp_path,
+        diagnosis,
+        permission,
+    )
     assert change_applier.can_apply_change(diagnosis, permission) is True
-    success = change_applier.apply_change(diagnosis, permission)
+    success = change_applier.apply_change(
+        diagnosis,
+        permission,
+        transaction_id,
+    )
 
     assert success is True
     assert target_path.read_text(encoding="utf-8") == "changed value\n"
@@ -942,11 +1018,46 @@ def test_apply_change_uses_real_validation_and_keeps_change(
         .splitlines()[-1]
     )
     assert validation_record["previous_run_id"] == "diagnosis-run-id"
+    assert validation_record["transaction_id"] == transaction_id
     assert validation_record["post_change_run_id"] == latest_test_result["run_id"]
     assert validation_record["post_change_run_id"] != "diagnosis-run-id"
     assert validation_record["change_aware_validation_status"] == "PASSED"
     assert validation_record["scope_validation_status"] == "PASSED"
     assert validation_record["final_validation_status"] == "PASSED"
+    transaction_record = change_transaction.get_transaction(
+        transaction_id,
+        change_applier.CHANGE_TRANSACTIONS_FILE,
+    )
+    assert transaction_record is not None
+    assert transaction_record["state"] == "SUCCEEDED"
+    assert transaction_record["final_outcome"] == "SUCCESS"
+    assert transaction_record["post_change_run_id"] == latest_test_result["run_id"]
+    assert transaction_record["post_change_test_status"] == "PASSED"
+    assert transaction_record["diagnosis_run_id"] == "diagnosis-run-id"
+    assert transaction_record["pre_change_run_id"] == "diagnosis-run-id"
+    assert transaction_record["change_aware_validation_status"] == "PASSED"
+    assert transaction_record["scope_validation_status"] == "PASSED"
+    assert transaction_record["actual_changed_files"] == [
+        "rollback_target.txt"
+    ]
+    transaction_updates = [
+        json.loads(line)
+        for line in change_applier.CHANGE_TRANSACTIONS_FILE.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert {
+        update["transaction_id"]
+        for update in transaction_updates
+    } == {transaction_id}
+    assert [update["state"] for update in transaction_updates] == [
+        "PROPOSED",
+        "AWAITING_PERMISSION",
+        "APPROVED",
+        "APPLYING",
+        "VALIDATING",
+        "SUCCEEDED",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1005,9 +1116,17 @@ def test_scope_validation_failure_or_inconclusive_rolls_back(
         previous_failure_file=approved_files[0],
     )
 
+    permission = make_approved_permission(diagnosis)
+    transaction_id = prepare_approved_transaction(
+        monkeypatch,
+        tmp_path,
+        diagnosis,
+        permission,
+    )
     assert change_applier.apply_change(
         diagnosis,
-        make_approved_permission(diagnosis),
+        permission,
+        transaction_id,
     ) is False
     assert target_path.read_text(encoding="utf-8") == original_content
 
@@ -1019,6 +1138,14 @@ def test_scope_validation_failure_or_inconclusive_rolls_back(
     assert validation_record["change_aware_validation_status"] == "PASSED"
     assert validation_record["scope_validation_status"] == expected_scope_status
     assert validation_record["final_validation_status"] == expected_scope_status
+    transaction_record = change_transaction.get_transaction(
+        transaction_id,
+        change_applier.CHANGE_TRANSACTIONS_FILE,
+    )
+    assert transaction_record is not None
+    assert transaction_record["state"] == "ROLLED_BACK"
+    assert transaction_record["final_outcome"] == "ROLLED_BACK"
+    assert transaction_record["rollback_succeeded"] is True
 
 
 def test_apply_change_rolls_back_when_validation_record_cannot_be_persisted(
@@ -1063,6 +1190,13 @@ def test_apply_change_rolls_back_when_validation_record_cannot_be_persisted(
         exit_code=0,
         previous_run_id="diagnosis-run-id",
     )
+    permission = make_approved_permission(diagnosis)
+    transaction_id = prepare_approved_transaction(
+        monkeypatch,
+        tmp_path,
+        diagnosis,
+        permission,
+    )
     invalid_parent = tmp_path / "not-a-directory"
     invalid_parent.write_text("file blocks log directory", encoding="utf-8")
     monkeypatch.setattr(
@@ -1073,9 +1207,294 @@ def test_apply_change_rolls_back_when_validation_record_cannot_be_persisted(
 
     assert change_applier.apply_change(
         diagnosis,
-        make_approved_permission(diagnosis),
+        permission,
+        transaction_id,
     ) is False
     assert target_path.read_text(encoding="utf-8") == original_content
+
+
+def test_mismatched_transaction_id_rejects_change_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    target_path = project_dir / "rollback_target.txt"
+    original_content = "original value\n"
+    target_path.write_text(original_content, encoding="utf-8")
+    diagnosis: change_applier.DiagnosisRecord = {
+        "run_id": "diagnosis-run-id",
+        "timestamp": "diagnosis-time",
+        "test_timestamp": "test-time",
+        "test_status": "FAILED",
+        "diagnosis": {
+            "status": "FAILED",
+            "diagnosis": "Test diagnosis",
+            "likely_cause": "Test cause",
+            "file": "rollback_target.txt",
+            "line": 1,
+            "confidence": "HIGH",
+            "evidence": [],
+            "next_step": "Apply the change",
+            "proposed_change": "Use new content",
+            "affected_files": ["rollback_target.txt"],
+            "change_size": "SMALL",
+            "exact_change": {
+                "file": "rollback_target.txt",
+                "line": 1,
+                "old_text": original_content,
+                "new_text": "changed value\n",
+            },
+        },
+    }
+    permission = make_approved_permission(diagnosis)
+    transaction_id = prepare_approved_transaction(
+        monkeypatch,
+        tmp_path,
+        diagnosis,
+        permission,
+    )
+    permission["transaction_id"] = "different-transaction-id"
+    monkeypatch.setattr(change_applier, "PROJECT_FOLDER", project_dir)
+
+    assert (
+        change_applier.apply_change(
+            diagnosis,
+            permission,
+            transaction_id,
+        )
+        is False
+    )
+    assert target_path.read_text(encoding="utf-8") == original_content
+    transaction = change_transaction.get_transaction(
+        transaction_id,
+        change_applier.CHANGE_TRANSACTIONS_FILE,
+    )
+    assert transaction is not None
+    assert transaction["state"] == "APPROVED"
+
+
+def test_untracked_transaction_id_cannot_authorize_change(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    target_path = project_dir / "rollback_target.txt"
+    original_content = "original value\n"
+    target_path.write_text(original_content, encoding="utf-8")
+    diagnosis: change_applier.DiagnosisRecord = {
+        "run_id": "diagnosis-run-id",
+        "timestamp": "diagnosis-time",
+        "test_timestamp": "test-time",
+        "test_status": "FAILED",
+        "diagnosis": {
+            "status": "FAILED",
+            "diagnosis": "Test diagnosis",
+            "likely_cause": "Test cause",
+            "file": "rollback_target.txt",
+            "line": 1,
+            "confidence": "HIGH",
+            "evidence": [],
+            "next_step": "Apply the change",
+            "proposed_change": "Use new content",
+            "affected_files": ["rollback_target.txt"],
+            "change_size": "SMALL",
+            "exact_change": {
+                "file": "rollback_target.txt",
+                "line": 1,
+                "old_text": original_content,
+                "new_text": "changed value\n",
+            },
+        },
+    }
+    permission = make_approved_permission(diagnosis)
+    transaction_id = prepare_approved_transaction(
+        monkeypatch,
+        tmp_path,
+        diagnosis,
+        permission,
+    )
+    diagnosis["transaction_id"] = "untracked-transaction"
+    permission["transaction_id"] = "untracked-transaction"
+    monkeypatch.setattr(change_applier, "PROJECT_FOLDER", project_dir)
+
+    assert change_applier.can_apply_change(diagnosis, permission) is True
+    assert change_applier.apply_change(
+        diagnosis,
+        permission,
+        "untracked-transaction",
+    ) is False
+    assert target_path.read_text(encoding="utf-8") == original_content
+    transaction = change_transaction.get_transaction(
+        transaction_id,
+        change_applier.CHANGE_TRANSACTIONS_FILE,
+    )
+    assert transaction is not None
+    assert transaction["state"] == "APPROVED"
+
+
+def test_failed_rollback_records_failed_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    target_path = project_dir / "rollback_target.txt"
+    original_content = "original value\n"
+    target_path.write_text(original_content, encoding="utf-8")
+    diagnosis: change_applier.DiagnosisRecord = {
+        "run_id": "diagnosis-run-id",
+        "timestamp": "diagnosis-time",
+        "test_timestamp": "test-time",
+        "test_status": "FAILED",
+        "diagnosis": {
+            "status": "FAILED",
+            "diagnosis": "Test diagnosis",
+            "likely_cause": "Test cause",
+            "file": "rollback_target.txt",
+            "line": 1,
+            "confidence": "HIGH",
+            "evidence": [],
+            "next_step": "Apply the change",
+            "proposed_change": "Use new content",
+            "affected_files": ["rollback_target.txt"],
+            "change_size": "SMALL",
+            "exact_change": {
+                "file": "rollback_target.txt",
+                "line": 1,
+                "old_text": original_content,
+                "new_text": "changed value\n",
+            },
+        },
+    }
+    permission = make_approved_permission(diagnosis)
+    transaction_id = prepare_approved_transaction(
+        monkeypatch,
+        tmp_path,
+        diagnosis,
+        permission,
+    )
+    monkeypatch.setattr(change_applier, "PROJECT_FOLDER", project_dir)
+    monkeypatch.setattr(
+        change_applier,
+        "VALIDATION_RESULTS_FILE",
+        tmp_path / "logs" / "validation_results.jsonl",
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "analyze_post_change_validation",
+        lambda run_id, _files: {
+            "previous_run_id": run_id,
+            "post_change_run_id": "post-change-run",
+            "post_change_test_status": "FAILED",
+            "change_aware_validation_status": "FAILED",
+            "validation_evidence": ["Post-change validation failed."],
+        },
+    )
+    monkeypatch.setattr(
+        change_applier,
+        "restore_original_file",
+        lambda _target, _content: False,
+    )
+
+    assert change_applier.apply_change(
+        diagnosis,
+        permission,
+        transaction_id,
+    ) is False
+    transaction = change_transaction.get_transaction(
+        transaction_id,
+        change_applier.CHANGE_TRANSACTIONS_FILE,
+    )
+    assert transaction is not None
+    assert transaction["state"] == "FAILED"
+    assert transaction["final_outcome"] == "FAILED"
+    assert transaction["rollback_succeeded"] is False
+
+
+def test_transaction_persistence_failure_rolls_back_successful_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    target_path = project_dir / "rollback_target.txt"
+    original_content = "original value\n"
+    target_path.write_text(original_content, encoding="utf-8")
+    diagnosis: change_applier.DiagnosisRecord = {
+        "run_id": "diagnosis-run-id",
+        "timestamp": "diagnosis-time",
+        "test_timestamp": "test-time",
+        "test_status": "FAILED",
+        "diagnosis": {
+            "status": "FAILED",
+            "diagnosis": "Integration diagnosis",
+            "likely_cause": "Integration cause",
+            "file": "rollback_target.txt",
+            "line": 1,
+            "confidence": "HIGH",
+            "evidence": [],
+            "next_step": "Apply the change",
+            "proposed_change": "Use new content",
+            "affected_files": ["rollback_target.txt"],
+            "change_size": "SMALL",
+            "exact_change": {
+                "file": "rollback_target.txt",
+                "line": 1,
+                "old_text": original_content,
+                "new_text": "changed value\n",
+            },
+        },
+    }
+    permission = make_approved_permission(diagnosis)
+    transaction_log = tmp_path / "logs" / "change_transactions.jsonl"
+    transaction_id = prepare_approved_transaction(
+        monkeypatch,
+        tmp_path,
+        diagnosis,
+        permission,
+        transaction_log,
+    )
+    _prepare_real_tester_environment(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        exit_code=0,
+        previous_run_id="diagnosis-run-id",
+    )
+    monkeypatch.setattr(change_applier, "PROJECT_FOLDER", project_dir)
+
+    append_transaction = change_transaction._append_transaction
+
+    def fail_success_event(
+        record: change_transaction.ChangeTransaction,
+        log_path: Path,
+    ) -> None:
+        if record["state"] == "SUCCEEDED":
+            append_transaction(record, log_path)
+            raise OSError("simulated transaction log failure")
+        append_transaction(record, log_path)
+
+    monkeypatch.setattr(
+        change_transaction,
+        "_append_transaction",
+        fail_success_event,
+    )
+
+    assert change_applier.apply_change(
+        diagnosis,
+        permission,
+        transaction_id,
+    ) is False
+    assert target_path.read_text(encoding="utf-8") == original_content
+    transaction = change_transaction.get_transaction(
+        transaction_id,
+        transaction_log,
+    )
+    assert transaction is not None
+    assert transaction["state"] == "ROLLED_BACK"
+    assert transaction["final_outcome"] == "ROLLED_BACK"
+    assert transaction["final_validation_status"] == "PASSED"
 
 
 def test_apply_change_rolls_back_when_real_validation_fails(
@@ -1127,9 +1546,17 @@ def test_apply_change_rolls_back_when_real_validation_fails(
         project_dir,
     )
 
+    permission = make_approved_permission(diagnosis)
+    transaction_id = prepare_approved_transaction(
+        monkeypatch,
+        tmp_path,
+        diagnosis,
+        permission,
+    )
     success = change_applier.apply_change(
         diagnosis,
-        make_approved_permission(diagnosis),
+        permission,
+        transaction_id,
     )
 
     assert success is False
@@ -1203,10 +1630,18 @@ def test_apply_change_rolls_back_when_real_validation_is_inconclusive(
         project_dir,
     )
 
+    permission = make_approved_permission(diagnosis)
+    transaction_id = prepare_approved_transaction(
+        monkeypatch,
+        tmp_path,
+        diagnosis,
+        permission,
+    )
     assert change_applier.can_apply_change(diagnosis, permission) is True
     assert change_applier.apply_change(
         diagnosis,
-        make_approved_permission(diagnosis),
+        permission,
+        transaction_id,
     ) is False
     assert target_path.read_text(encoding="utf-8") == original_content
     assert "Change-aware validation status: INCONCLUSIVE" in capsys.readouterr().out
